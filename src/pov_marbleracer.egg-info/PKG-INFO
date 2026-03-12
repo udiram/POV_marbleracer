@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: pov-marbleracer
+Version: 0.1.0
+Summary: First-person marble racing vertical slice built with Panda3D
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: panda3d>=1.10
+
+# POV Marble Racer
+
+A Panda3D vertical slice where the player races a marble through a tabletop obstacle course with first-person and chase camera modes.
+
+## Run
+
+```bash
+python3 -m pip install -e .
+marbleracer
+```
+
+## Controls
+
+- `WASD` steer the marble
+- `Space` start race from the title screen
+- `C` toggle between POV and chase camera
+- `R` reset to the latest checkpoint
+- `Esc` pause or return to title after the finish screen

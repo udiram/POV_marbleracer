@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/marbleracer/__init__.py
+src/marbleracer/config.py
+src/marbleracer/game.py
+src/marbleracer/main.py
+src/marbleracer/track.py
+src/pov_marbleracer.egg-info/PKG-INFO
+src/pov_marbleracer.egg-info/SOURCES.txt
+src/pov_marbleracer.egg-info/dependency_links.txt
+src/pov_marbleracer.egg-info/entry_points.txt
+src/pov_marbleracer.egg-info/requires.txt
+src/pov_marbleracer.egg-info/top_level.txt
+tests/test_config.py

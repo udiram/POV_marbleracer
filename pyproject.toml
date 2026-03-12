@@ -1,0 +1,22 @@
+[project]
+name = "pov-marbleracer"
+version = "0.1.0"
+description = "First-person marble racing vertical slice built with Panda3D"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "panda3d>=1.10",
+]
+
+[project.scripts]
+marbleracer = "marbleracer.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
