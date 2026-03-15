@@ -1,18 +1,42 @@
-# POV Marble Racer
+# Panda3D Marble Ramp Simulation
 
-A Panda3D vertical slice where the player races a marble through a tabletop obstacle course with first-person and chase camera modes.
+This project renders a single marble rolling down a long desk-style ramp in Panda3D with an explicit rigid-body model for a solid sphere rolling without slipping. The default scene now uses a seeded obstacle-course generator that builds mixed obstacle patterns and rejects layouts the marble cannot clear.
+
+## Physics model
+
+- Marble treated as a solid sphere with moment of inertia `I = 2/5 m r^2`
+- Ramp acceleration derived from rigid-body rolling dynamics:
+  `a = g sin(theta) / (1 + I / (m r^2)) = 5/7 g sin(theta)`
+- Ramp contact is maintained until the marble reaches the end of the incline
+- After leaving the ramp, the marble continues as a projectile under gravity
+
+This is deliberately narrower than a full contact solver, but it is more physically defensible for the specific "marble on a ramp" case than a hand-tuned arcade controller.
+
+## Generated courses
+
+The obstacle layout is generated from `SimulationConfig(obstacle_count=..., course_seed=...)`.
+Instead of repeating one obstacle shape, the generator mixes sweepers, staggered blockers, bumpers, and pinch gates to create a more desk-marble-race feel.
+Each candidate pattern is inserted only if a Bullet simulation shows the marble can reach and clear it, and the final course is accepted only if the marble exits the ramp without stalling.
+
+```python
+from marbleracer import SimulationConfig, evaluate_course
+
+config = SimulationConfig(obstacle_count=10, course_seed=11)
+result = evaluate_course(config, max_time=22.0)
+print(len(config.obstacles), result.exited_ramp, result.obstacle_hits)
+```
 
 ## Run
 
 ```bash
-python3 -m pip install -e .
-marbleracer
+./run_sim.sh
+./run_sim.sh --obstacle-count 10 --course-seed 11
 ```
 
 ## Controls
 
-- `WASD` steer the marble
-- `Space` start race from the title screen
-- `C` toggle between POV and chase camera
-- `R` reset to the latest checkpoint
-- `Esc` pause or return to title after the finish screen
+- `Space` pause or resume
+- `Left/Right` steer the marble laterally
+- `Down` brake and bleed speed while held
+- `R` reset the marble to the top of the ramp
+- `Esc` quit
