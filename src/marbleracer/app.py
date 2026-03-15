@@ -38,7 +38,6 @@ from .physics import (
     MarbleRampSimulation,
     SimulationConfig,
     boost_pad_center_position,
-    is_position_off_track,
     obstacle_center_position,
     ramp_normal,
     ramp_segment_at_distance,
@@ -94,6 +93,15 @@ def smooth_value(current: float, target: float, response: float, dt: float) -> f
     return current + (target - current) * smoothing_alpha(response, dt)
 
 
+def smooth_vec3(current: Vec3, target: Vec3, response: float, dt: float) -> Vec3:
+    alpha = smoothing_alpha(response, dt)
+    return current * (1.0 - alpha) + target * alpha
+
+
+def clamp_frame_dt(dt: float, *, max_dt: float = 1.0 / 30.0) -> float:
+    return max(0.0, min(dt, max_dt))
+
+
 def smooth_binary_state(
     current: float,
     active: bool,
@@ -131,17 +139,21 @@ class MarbleRampApp(ShowBase):
         super().__init__()
         self.sim_config = config or SimulationConfig()
         self.simulation = MarbleRampSimulation(self.sim_config)
+        self.simulation.settle_start_contact()
         self.paused = False
         self.camera_follow_distance = 7.4
         self.camera_height = 5.2
         self.camera_look_ahead = 3.2
         self.camera_side_offset = -0.25
         self.camera_target_drop = 0.45
+        self.camera_track_follow_offset = 0.18
+        self.camera_track_max_lag = 0.48
         self.camera_focus_lateral_lag = 1.6
         self.camera_focus_vertical_lag = 1.9
         self.camera_position_lag = 4.8
         self.camera_look_lag = 5.2
         self.camera_track_lag = 4.4
+        self.camera_focus_lag = 3.8
         self.camera_heading_response = 2.0
         self.camera_velocity_heading_response = 2.8
         self.camera_collision_attack = 10.0
@@ -180,7 +192,7 @@ class MarbleRampApp(ShowBase):
         self.boost_chain = 0
         self.best_boost_chain = 0
         self.off_track_timer = 0.0
-        self.off_track_grace = 0.18
+        self.off_track_grace = 0.75
         self.last_supported_path_distance = 0.0
         self.impact_event_cooldown = 0.0
         self.next_section_index = 0
@@ -210,6 +222,10 @@ class MarbleRampApp(ShowBase):
         self._enter_title_state()
         self.taskMgr.add(self._tick, "marble-ramp-tick")
         self._apply_state()
+
+    @property
+    def finish_line_x(self) -> float:
+        return self.sim_config.length - 1.0
 
     def _setup_window(self) -> None:
         props = WindowProperties()
@@ -340,8 +356,7 @@ class MarbleRampApp(ShowBase):
     def _build_ramp(self) -> None:
         for index, (segment_np, _, segment) in enumerate(self.simulation.ramp_nodes):
             ramp = self.scene_root.attachNewNode(f"ramp-{index}")
-            ramp.setH(segment.heading_deg)
-            ramp.setR(self.sim_config.angle_deg)
+            ramp.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
             ramp.setPos(segment_np.getPos())
 
             surface = ramp.attachNewNode("surface")
@@ -408,12 +423,66 @@ class MarbleRampApp(ShowBase):
                 style="screen",
             )
             underlight.setPos(0.0, 0.0, -0.30)
+        self._build_continuous_track_skin()
+
+    def _sample_track_angles(self, distance: float) -> tuple[float, float]:
+        segments = self.simulation.ramp_segments
+        if not segments:
+            return 0.0, 0.0
+        segment_length = self.sim_config.length / len(segments)
+        clamped = max(0.0, min(self.sim_config.length - 1e-6, distance))
+        index = min(int(clamped / segment_length), len(segments) - 1)
+        next_index = min(index + 1, len(segments) - 1)
+        local_t = (clamped - segments[index].start_distance) / segment_length
+        blend = local_t * local_t * (3.0 - 2.0 * local_t)
+        heading = segments[index].heading_deg * (1.0 - blend) + segments[next_index].heading_deg * blend
+        bank = segments[index].bank_deg * (1.0 - blend) + segments[next_index].bank_deg * blend
+        return heading, bank
+
+    def _build_continuous_track_skin(self) -> None:
+        sample_count = max(64, len(self.simulation.ramp_segments) * 5)
+        slice_length = self.sim_config.length / sample_count
+        for index in range(sample_count):
+            distance = min(self.sim_config.length - slice_length * 0.5, (index + 0.5) * slice_length)
+            heading_deg, bank_deg = self._sample_track_angles(distance)
+            center = ramp_surface_point(self.sim_config, distance)
+            normal = ramp_normal(self.sim_config, distance)
+
+            skin = self.scene_root.attachNewNode(f"track-skin-{index}")
+            skin.setPos(center + normal * 0.003)
+            skin.setHpr(heading_deg, bank_deg, self.sim_config.angle_deg)
+
+            surface = skin.attachNewNode("surface")
+            self._attach_centered_box(
+                surface,
+                size=Vec3(slice_length * 1.10, self.sim_config.width * 0.86, 0.006),
+                color=Vec4(0.19, 0.20, 0.22, 1.0),
+                style="track",
+            )
+
+            lane = skin.attachNewNode("lane")
+            self._attach_centered_box(
+                lane,
+                size=Vec3(slice_length * 1.06, self.sim_config.width * 0.10, 0.006),
+                color=Vec4(0.84, 0.86, 0.90, 1.0),
+                style="screen",
+            )
+            lane.setZ(0.006)
+
+            for side in (-1, 1):
+                trim = skin.attachNewNode(f"trim-{side}")
+                self._attach_centered_box(
+                    trim,
+                    size=Vec3(slice_length * 1.06, 0.05, 0.024),
+                    color=Vec4(0.52, 0.58, 0.66, 1.0),
+                    style="screen",
+                )
+                trim.setPos(0.0, side * (self.sim_config.width * 0.425), 0.008)
 
     def _build_rails(self) -> None:
         for index, (rail_np, _, segment, lateral_offset) in enumerate(self.simulation.rail_nodes):
             rail = self.scene_root.attachNewNode(f"rail-{index}")
-            rail.setH(segment.heading_deg)
-            rail.setR(self.sim_config.angle_deg)
+            rail.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
             rail.setPos(rail_np.getPos())
 
             beam = rail.attachNewNode("beam")
@@ -476,8 +545,7 @@ class MarbleRampApp(ShowBase):
             segment = ramp_segment_at_distance(self.sim_config, distance)
             gate = self.scene_root.attachNewNode(f"section-gate-{index}")
             gate.setPos(ramp_surface_point(self.sim_config, distance))
-            gate.setH(segment.heading_deg)
-            gate.setR(self.sim_config.angle_deg)
+            gate.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
 
             for side in (-1, 1):
                 post = gate.attachNewNode(f"post-{side}")
@@ -542,8 +610,7 @@ class MarbleRampApp(ShowBase):
                 if config_pad is not None
                 else ramp_surface_point(self.sim_config, distance) + ramp_normal(self.sim_config, distance) * 0.018
             )
-            pad.setH(segment.heading_deg)
-            pad.setR(self.sim_config.angle_deg)
+            pad.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
 
             frame = pad.attachNewNode("frame")
             self._attach_centered_box(
@@ -593,7 +660,7 @@ class MarbleRampApp(ShowBase):
 
     def _build_finish_gate(self) -> None:
         gate = self.scene_root.attachNewNode("finish-gate")
-        gate.setPos(self.sim_config.length - 1.0, 0.0, 0.0)
+        gate.setPos(self.finish_line_x, 0.0, 0.0)
         for side in (-1, 1):
             post = gate.attachNewNode(f"post-{side}")
             self._attach_centered_box(
@@ -611,10 +678,46 @@ class MarbleRampApp(ShowBase):
         stripe = gate.attachNewNode("stripe")
         self._attach_centered_box(stripe, size=Vec3(0.08, 2.6, 0.08), color=Vec4(0.24, 0.70, 0.92, 1.0), style="screen")
         stripe.setPos(0.0, 0.0, 2.92)
+        self._register_pulse(stripe, amplitude=0.40, speed=2.6, phase=0.4)
+
+        finish_ribbon = gate.attachNewNode("finish-ribbon")
+        self._attach_centered_box(
+            finish_ribbon,
+            size=Vec3(0.06, self.sim_config.width * 0.96, 0.18),
+            color=Vec4(0.90, 0.94, 0.98, 1.0),
+            style="screen",
+        )
+        finish_ribbon.setPos(0.0, 0.0, 1.18)
+        self._register_pulse(finish_ribbon, amplitude=0.32, speed=2.2, phase=0.0)
+
+        for index, lateral in enumerate((-0.72, -0.36, 0.0, 0.36, 0.72)):
+            marker = gate.attachNewNode(f"finish-marker-{index}")
+            self._attach_centered_box(
+                marker,
+                size=Vec3(0.10, 0.22, 0.04),
+                color=Vec4(0.18, 0.82, 0.96, 1.0) if index % 2 == 0 else Vec4(0.96, 0.96, 0.98, 1.0),
+                style="screen",
+            )
+            marker.setPos(0.0, lateral, 0.10)
+            self._register_pulse(marker, amplitude=0.22, speed=2.0, phase=index * 0.3)
 
         pad = gate.attachNewNode("finish-pad")
-        self._attach_centered_box(pad, size=Vec3(0.24, self.sim_config.width * 0.82, 0.02), color=Vec4(0.24, 0.70, 0.92, 1.0))
-        pad.setPos(0.05, 0.0, 0.08)
+        self._attach_centered_box(
+            pad,
+            size=Vec3(0.60, self.sim_config.width * 0.96, 0.016),
+            color=Vec4(0.24, 0.70, 0.92, 1.0),
+            style="screen",
+        )
+        pad.setPos(0.02, 0.0, 0.02)
+
+        for index, lateral in enumerate((-0.78, -0.52, -0.26, 0.0, 0.26, 0.52, 0.78)):
+            tile = gate.attachNewNode(f"finish-tile-{index}")
+            self._attach_centered_box(
+                tile,
+                size=Vec3(0.16, 0.16, 0.008),
+                color=Vec4(0.96, 0.96, 0.98, 1.0) if index % 2 == 0 else Vec4(0.16, 0.18, 0.22, 1.0),
+            )
+            tile.setPos(0.08, lateral, 0.03)
 
     def _build_obstacles(self) -> None:
         colors = {
@@ -631,8 +734,8 @@ class MarbleRampApp(ShowBase):
         self._build_obstacle_marker(obstacle, color)
         obstacle_np = self.scene_root.attachNewNode("obstacle")
         self._attach_obstacle_visual(obstacle_np, obstacle, color)
-        obstacle_np.setH(obstacle.heading_deg)
-        obstacle_np.setR(self.sim_config.angle_deg)
+        segment = ramp_segment_at_distance(self.sim_config, obstacle.distance_along_ramp)
+        obstacle_np.setHpr(segment.heading_deg + obstacle.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
         obstacle_np.setPos(obstacle_center_position(self.sim_config, obstacle))
 
     def _build_obstacle_marker(self, obstacle: GuideObstacle, color: Vec4) -> None:
@@ -644,8 +747,7 @@ class MarbleRampApp(ShowBase):
             + ramp_side(self.sim_config, marker_distance) * obstacle.lateral_offset
             + ramp_normal(self.sim_config, marker_distance) * 0.02
         )
-        marker.setH(segment.heading_deg)
-        marker.setR(self.sim_config.angle_deg)
+        marker.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
 
         plate_width = min(self.sim_config.width * 0.78, obstacle.width + 0.42)
         self._attach_centered_box(
@@ -979,7 +1081,7 @@ class MarbleRampApp(ShowBase):
             mayChange=False,
         )
         self.subtitle = OnscreenText(
-            text="Simple long track. Sparse obstacles. Clean resets.",
+            text="Long banked course. Sparse obstacles. Fast lines.",
             pos=(-1.30, 0.85),
             align=TextNode.ALeft,
             scale=0.030,
@@ -1131,7 +1233,7 @@ class MarbleRampApp(ShowBase):
     def _enter_title_state(self) -> None:
         self.race_phase = "title"
         self.paused = False
-        self.current_section_name = "Long Course"
+        self.current_section_name = "Banked Course"
         self.current_section_focus = "Press Space to start"
         self._show_event(
             "MARBLE PHYSICS RUN",
@@ -1171,6 +1273,7 @@ class MarbleRampApp(ShowBase):
 
     def _reset(self) -> None:
         self.simulation.reset()
+        self.simulation.settle_start_contact()
         self.paused = False
         self.steering_input = 0.0
         self.brake_input = 0.0
@@ -1279,42 +1382,12 @@ class MarbleRampApp(ShowBase):
         self.finish_flash = 0.25
 
     def _should_reset_for_off_track(self, previous_state, state, dt: float) -> bool:
-        reference_distance = max(self.last_supported_path_distance, previous_state.path_distance)
-        surface_point = ramp_surface_point(self.sim_config, reference_distance)
-        relative = state.position - surface_point
-        lateral_offset = abs(relative.dot(ramp_side(self.sim_config, reference_distance)))
-        normal_offset = relative.dot(ramp_normal(self.sim_config, reference_distance))
-        vertical_drop = surface_point.z - state.position.z
+        catastrophic_off_track = state.position.z < -10.0
 
-        if (
-            lateral_offset <= self.sim_config.width * 0.5 + 0.08
-            and normal_offset >= -0.06
-            and vertical_drop <= 0.35
-        ):
-            self.last_supported_path_distance = max(self.last_supported_path_distance, state.path_distance)
-
-        off_track_candidate = is_position_off_track(
-            self.sim_config,
-            state.position,
-            reference_distance=reference_distance,
-        )
-        airborne_recovery = (
-            state.airborne
-            and lateral_offset <= self.sim_config.width * 0.5 + 0.18
-            and normal_offset > -0.06
-            and vertical_drop < 0.65
-        )
-        hard_off_track = (
-            lateral_offset > self.sim_config.width * 0.5 + 0.42
-            or normal_offset < -0.52
-            or vertical_drop > 1.35
-            or state.position.z < -2.0
-        )
-
-        if off_track_candidate and not airborne_recovery:
-            self.off_track_timer += dt * (3.0 if hard_off_track else 1.0)
+        if catastrophic_off_track:
+            self.off_track_timer += dt
         else:
-            self.off_track_timer = max(0.0, self.off_track_timer - dt * 2.5)
+            self.off_track_timer = max(0.0, self.off_track_timer - dt * 3.0)
 
         return self.off_track_timer >= self.off_track_grace
 
@@ -1324,7 +1397,7 @@ class MarbleRampApp(ShowBase):
             if active_index is not None and active_index < len(self.boost_pads):
                 self._activate_boost_pad(self.boost_pads[active_index], active_index)
 
-        if state.path_distance >= self.sim_config.length - self.sim_config.marble_radius:
+        if state.position.x >= self.finish_line_x:
             self._finish_run(state)
             return
 
@@ -1351,7 +1424,7 @@ class MarbleRampApp(ShowBase):
             self.boost_chain = 0
 
     def _tick(self, task: Task) -> int:
-        dt = min(globalClock.getDt(), 1.0 / 120.0)
+        dt = clamp_frame_dt(globalClock.getDt())
         self._update_feedback_state(dt)
         if not self.paused:
             if self.race_phase == "countdown":
@@ -1582,32 +1655,25 @@ class MarbleRampApp(ShowBase):
         self._texture_cache[style] = texture
         return texture
 
+    def _sample_track_forward(self, distance: float) -> Vec3:
+        sample_offsets = (-1.2, -0.6, 0.0, 0.6, 1.2)
+        blended_forward = Vec3(0.0, 0.0, 0.0)
+        for offset in sample_offsets:
+            sample_distance = max(0.0, min(self.sim_config.length, distance + offset))
+            tangent = ramp_tangent(self.sim_config, sample_distance)
+            tangent.z = 0.0
+            if tangent.length_squared() <= 1e-9:
+                continue
+            tangent.normalize()
+            blended_forward += tangent
+        if blended_forward.length_squared() <= 1e-9:
+            return Vec3(self.camera_forward)
+        blended_forward.normalize()
+        return blended_forward
+
     def _update_camera(self, state, dt: float) -> None:
         if self.camera is None or self.camLens is None:
             return
-        track_response = self.camera_track_lag * (1.0 - 0.45 * self.camera_collision_blend)
-        track_alpha = smoothing_alpha(track_response, dt)
-        target_track_distance = max(self.camera_track_distance, max(0.0, state.path_distance - 0.40))
-        self.camera_track_distance += (target_track_distance - self.camera_track_distance) * track_alpha
-
-        track_forward = ramp_tangent(self.sim_config, self.camera_track_distance)
-        track_forward.z = 0.0
-        if track_forward.length_squared() > 1e-9:
-            track_forward.normalize()
-
-        desired_velocity_forward = Vec3(track_forward)
-        velocity_forward = Vec3(state.linear_velocity.x, state.linear_velocity.y, 0.0)
-        if velocity_forward.length_squared() > 0.16:
-            velocity_forward.normalize()
-            desired_velocity_forward = velocity_forward
-        velocity_response = self.camera_velocity_heading_response * (1.0 - 0.55 * self.camera_collision_blend)
-        velocity_alpha = smoothing_alpha(velocity_response, dt)
-        self.camera_velocity_forward = (
-            self.camera_velocity_forward * (1.0 - velocity_alpha) + desired_velocity_forward * velocity_alpha
-        )
-        if self.camera_velocity_forward.length_squared() > 1e-9:
-            self.camera_velocity_forward.normalize()
-
         self.camera_collision_blend = smooth_binary_state(
             self.camera_collision_blend,
             state.total_contacts > 0,
@@ -1615,62 +1681,70 @@ class MarbleRampApp(ShowBase):
             attack_response=self.camera_collision_attack,
             release_response=self.camera_collision_release,
         )
-        velocity_mix = min(0.18, state.speed * 0.025) * (1.0 - 0.92 * self.camera_collision_blend)
-        target_forward = track_forward * (1.0 - velocity_mix) + self.camera_velocity_forward * velocity_mix
-        if target_forward.length_squared() > 1e-9:
-            target_forward.normalize()
+
+        target_track_distance = max(0.0, state.path_distance - self.camera_track_follow_offset)
+        self.camera_track_distance = max(
+            target_track_distance - self.camera_track_max_lag,
+            min(state.path_distance, target_track_distance),
+        )
+
+        track_forward = self._sample_track_forward(state.path_distance + 0.55)
+        velocity_forward = Vec3(state.linear_velocity.x, state.linear_velocity.y, 0.0)
+        target_forward = Vec3(track_forward)
+        if velocity_forward.length_squared() > 0.64:
+            velocity_forward.normalize()
+            alignment = velocity_forward.dot(track_forward)
+            if alignment > 0.6:
+                velocity_mix = min(0.12, (alignment - 0.6) * 0.30)
+                target_forward = track_forward * (1.0 - velocity_mix) + velocity_forward * velocity_mix
+                if target_forward.length_squared() > 1e-9:
+                    target_forward.normalize()
 
         heading_alpha = smoothing_alpha(self.camera_heading_response, dt)
         self.camera_forward = self.camera_forward * (1.0 - heading_alpha) + target_forward * heading_alpha
         self.camera_forward.normalize()
 
-        track_point = ramp_surface_point(self.sim_config, self.camera_track_distance)
-        track_side = ramp_side(self.sim_config, self.camera_track_distance)
-        track_normal = ramp_normal(self.sim_config, self.camera_track_distance)
-        track_focus = track_point + track_normal * (self.sim_config.marble_radius + 0.05)
-        collision_damping = 1.0 - 0.82 * self.camera_collision_blend
+        track_point = ramp_surface_point(self.sim_config, state.path_distance)
+        track_side = ramp_side(self.sim_config, state.path_distance)
+        track_normal = ramp_normal(self.sim_config, state.path_distance)
+        base_focus = state.position + track_normal * 0.20
         lateral_error = max(
-            -self.sim_config.width * 0.16,
+            -self.sim_config.width * 0.10,
             min(
-                self.sim_config.width * 0.16,
-                (state.position - track_focus).dot(track_side),
+                self.sim_config.width * 0.10,
+                (state.position - track_point).dot(track_side),
             ),
-        ) * collision_damping
-        vertical_error = max(
-            -0.04,
-            min(
-                0.18,
-                state.position.z - track_focus.z,
-            ),
-        ) * collision_damping
-
-        focus_response_scale = 1.0 - 0.60 * self.camera_collision_blend
-        lateral_alpha = smoothing_alpha(self.camera_focus_lateral_lag * focus_response_scale, dt)
-        vertical_alpha = smoothing_alpha(self.camera_focus_vertical_lag * focus_response_scale, dt)
-        self.camera_focus_lateral_offset += (
-            lateral_error - self.camera_focus_lateral_offset
-        ) * lateral_alpha
-        self.camera_focus_vertical_offset += (
-            vertical_error - self.camera_focus_vertical_offset
-        ) * vertical_alpha
-
+        )
+        vertical_error = max(-0.02, min(0.12, state.position.z - track_point.z))
+        self.camera_focus_lateral_offset = smooth_value(
+            self.camera_focus_lateral_offset,
+            lateral_error * (1.0 - 0.45 * self.camera_collision_blend),
+            self.camera_focus_lateral_lag,
+            dt,
+        )
+        self.camera_focus_vertical_offset = smooth_value(
+            self.camera_focus_vertical_offset,
+            vertical_error * (1.0 - 0.35 * self.camera_collision_blend),
+            self.camera_focus_vertical_lag,
+            dt,
+        )
         desired_focus = (
-            track_focus
+            base_focus
             + track_side * self.camera_focus_lateral_offset
             + Vec3(0.0, 0.0, self.camera_focus_vertical_offset)
         )
-        self.camera_focus = Vec3(desired_focus)
-        speed_boost = min(1.2, state.speed * 0.06)
-        side_vector = self.camera_forward.cross(Vec3(0.0, 0.0, 1.0))
+        self.camera_focus = smooth_vec3(self.camera_focus, desired_focus, self.camera_focus_lag, dt)
+
+        side_vector = Vec3(-self.camera_forward.y, self.camera_forward.x, 0.0)
         if side_vector.length_squared() > 1e-9:
             side_vector.normalize()
-        desired_camera_pos = desired_focus - self.camera_forward * (self.camera_follow_distance + speed_boost) + Vec3(
+        desired_camera_pos = self.camera_focus - self.camera_forward * self.camera_follow_distance + Vec3(
             0.0,
             0.0,
-            self.camera_height + speed_boost * 0.25,
+            self.camera_height,
         ) + side_vector * self.camera_side_offset
-        desired_camera_pos.z = max(desired_camera_pos.z, desired_focus.z + 2.2)
-        desired_look_target = desired_focus + self.camera_forward * (self.camera_look_ahead + speed_boost * 0.45)
+        desired_camera_pos.z = max(desired_camera_pos.z, self.camera_focus.z + 2.2)
+        desired_look_target = self.camera_focus + self.camera_forward * self.camera_look_ahead
         desired_look_target.z -= self.camera_target_drop
 
         pos_alpha = smoothing_alpha(self.camera_position_lag, dt)

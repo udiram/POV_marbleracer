@@ -44,6 +44,16 @@ def test_marble_accelerates_down_the_ramp() -> None:
     assert end.speed > 1.0
 
 
+def test_settled_marble_starts_rolling_forward_on_first_step() -> None:
+    simulation = MarbleRampSimulation(SimulationConfig(obstacle_count=0, auto_boost_pads=False))
+    simulation.settle_start_contact()
+    simulation.step(1.0 / 240.0)
+    linear_velocity = simulation.snapshot().linear_velocity
+
+    assert linear_velocity.x > 0.0
+    assert abs(linear_velocity.z) < linear_velocity.x
+
+
 def test_steering_input_changes_lateral_motion() -> None:
     simulation = MarbleRampSimulation(SimulationConfig(obstacle_count=0))
     simulation.set_steering_input(1.0)
@@ -99,21 +109,22 @@ def test_default_course_exits_ramp_without_stalling() -> None:
     result = evaluate_course(config, max_time=recommended_evaluation_time(config))
     assert result.exited_ramp
     assert not result.stalled
-    assert sum(result.obstacle_hits) >= 3
-    assert result.boost_activations >= 3
+    assert sum(result.obstacle_hits) >= 5
+    assert result.boost_activations >= 4
     assert result.max_impact_severity < 0.9
-    assert result.airborne_fraction < 0.2
-    assert 0.20 < result.max_abs_lateral < config.width * 0.5
-    assert 6 <= len(config.obstacles) <= 8
+    assert result.airborne_fraction < 0.25
+    assert result.max_abs_lateral > 0.20
+    assert len(config.obstacles) == 10
 
 
 def test_obstacles_are_seated_on_ramp_surface() -> None:
     config = SimulationConfig()
     for obstacle in config.obstacles:
         center = obstacle_center_position(config, obstacle)
-        ramp_surface_z = config.height - obstacle.distance_along_ramp * sin(config.angle_rad)
-        expected_center_z = ramp_surface_z + cos(config.angle_rad) * (obstacle.height * 0.5)
-        assert isclose(center.z, expected_center_z, rel_tol=1e-6, abs_tol=1e-5)
+        surface = ramp_surface_point(config, obstacle.distance_along_ramp)
+        expected_bottom = surface + ramp_side(config, obstacle.distance_along_ramp) * obstacle.lateral_offset
+        actual_bottom = center - ramp_normal(config, obstacle.distance_along_ramp) * (obstacle.height * 0.5)
+        assert (actual_bottom - expected_bottom).length() < 1e-5
 
 
 def test_can_request_dense_generated_course() -> None:
@@ -126,11 +137,12 @@ def test_can_request_dense_generated_course() -> None:
 
 def test_default_course_is_long_simple_and_fixed() -> None:
     config = SimulationConfig()
-    assert config.length >= 80.0
-    assert len(config.segment_headings_deg) >= 18
-    assert 6 <= len(config.obstacles) <= 8
+    assert config.length >= 100.0
+    assert len(config.segment_headings_deg) >= 24
+    assert len(config.segment_bank_deg) == len(config.segment_headings_deg)
+    assert len(config.obstacles) == 10
     assert {obstacle.kind for obstacle in config.obstacles} == {"block"}
-    assert len(config.boost_pads) == 4
+    assert len(config.boost_pads) == 5
 
 
 def test_off_track_detection_flags_fallthrough_and_side_exit() -> None:

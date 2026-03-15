@@ -14,6 +14,8 @@ SOLID_SPHERE_INERTIA_RATIO = 2.0 / 5.0
 GENERATION_CLEARANCE = 0.18
 MIN_PASSAGE_WIDTH = 0.56
 BOOST_CLEARANCE_DISTANCE = 0.55
+MARBLE_START_SURFACE_CLEARANCE = 0.005
+TRACK_SEGMENT_SUBDIVISIONS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,15 +62,16 @@ class RampSegment:
     start_distance: float
     length: float
     heading_deg: float
+    bank_deg: float
     start_point: Vec3
 
 
 @dataclass(frozen=True, slots=True)
 class SimulationConfig:
     angle_deg: float = 16.5
-    length: float = 90.0
-    height: float = 34.0
-    width: float = 2.24
+    length: float = 108.0
+    height: float = 39.5
+    width: float = 2.32
     ramp_thickness: float = 0.22
     marble_radius: float = 0.22
     marble_mass: float = 0.18
@@ -83,28 +86,60 @@ class SimulationConfig:
     rail_width: float = 0.16
     steering_acceleration: float = 4.0
     brake_drag: float = 3.0
-    obstacle_count: int = 8
+    obstacle_count: int = 10
     course_seed: int = 7
     auto_boost_pads: bool = True
     segment_headings_deg: tuple[float, ...] = (
         0.0,
+        2.0,
+        5.0,
+        8.0,
+        11.0,
+        14.0,
+        16.0,
+        16.0,
+        14.0,
+        10.0,
+        6.0,
+        2.0,
+        -2.0,
+        -6.0,
+        -10.0,
+        -14.0,
+        -16.0,
+        -16.0,
+        -13.0,
+        -9.0,
+        -5.0,
+        -1.0,
         3.0,
+        7.0,
+    )
+    segment_bank_deg: tuple[float, ...] = (
+        0.0,
+        1.0,
+        2.0,
+        4.0,
         6.0,
         9.0,
         12.0,
         12.0,
         10.0,
-        8.0,
+        7.0,
         4.0,
-        0.0,
+        1.0,
+        -1.0,
         -4.0,
-        -8.0,
-        -12.0,
-        -12.0,
+        -7.0,
         -10.0,
-        -6.0,
-        -2.0,
+        -13.0,
+        -13.0,
+        -10.0,
+        -7.0,
+        -4.0,
+        -1.0,
         2.0,
+        4.0,
     )
     boost_pads: tuple[BoostPad, ...] = field(default_factory=tuple)
     obstacles: tuple[GuideObstacle, ...] = field(default_factory=tuple)
@@ -130,6 +165,10 @@ class SimulationConfig:
             raise ValueError("Obstacle count must be non-negative.")
         if not self.segment_headings_deg:
             raise ValueError("At least one ramp segment heading is required.")
+        if not self.segment_bank_deg:
+            object.__setattr__(self, "segment_bank_deg", tuple(0.0 for _ in self.segment_headings_deg))
+        if len(self.segment_bank_deg) != len(self.segment_headings_deg):
+            raise ValueError("Segment bank angles must align with the ramp heading segments.")
         if self.auto_boost_pads and not self.boost_pads:
             object.__setattr__(self, "boost_pads", default_boost_pads(self))
         if not self.obstacles and self.obstacle_count > 0:
@@ -225,6 +264,21 @@ def heading_side_vector(heading_deg: float) -> Vec3:
     return Vec3(-sin(heading_rad), cos(heading_rad), 0.0)
 
 
+def rotate_about_axis(vector: Vec3, axis: Vec3, angle_deg: float) -> Vec3:
+    if abs(angle_deg) <= 1e-9:
+        return Vec3(vector)
+    axis = Vec3(axis)
+    if axis.length_squared() <= 1e-12:
+        return Vec3(vector)
+    axis.normalize()
+    angle_rad = radians(angle_deg)
+    return (
+        vector * cos(angle_rad)
+        + axis.cross(vector) * sin(angle_rad)
+        + axis * axis.dot(vector) * (1.0 - cos(angle_rad))
+    )
+
+
 def heading_tangent_vector(config: SimulationConfig, heading_deg: float) -> Vec3:
     heading_rad = radians(heading_deg)
     theta = config.angle_rad
@@ -238,7 +292,13 @@ def ramp_tangent(config: SimulationConfig, distance_along_ramp: float = 0.0) -> 
 
 def ramp_side(config: SimulationConfig, distance_along_ramp: float = 0.0) -> Vec3:
     segment = ramp_segment_at_distance(config, distance_along_ramp)
-    return heading_side_vector(segment.heading_deg)
+    side = rotate_about_axis(
+        heading_side_vector(segment.heading_deg),
+        heading_tangent_vector(config, segment.heading_deg),
+        segment.bank_deg,
+    )
+    side.normalize()
+    return side
 
 
 def ramp_normal(config: SimulationConfig, distance_along_ramp: float = 0.0) -> Vec3:
@@ -249,19 +309,44 @@ def ramp_normal(config: SimulationConfig, distance_along_ramp: float = 0.0) -> V
     return normal
 
 
+def _interpolated_track_angles(
+    headings: tuple[float, ...],
+    banks: tuple[float, ...],
+    sample_index: int,
+    total_samples: int,
+) -> tuple[float, float]:
+    if len(headings) == 1:
+        return headings[0], banks[0]
+    coarse_position = (sample_index + 0.5) / max(1, total_samples) * len(headings) - 0.5
+    base_index = max(0, min(len(headings) - 1, int(coarse_position)))
+    next_index = min(base_index + 1, len(headings) - 1)
+    local_t = max(0.0, min(1.0, coarse_position - base_index))
+    blend = local_t * local_t * (3.0 - 2.0 * local_t)
+    heading = headings[base_index] * (1.0 - blend) + headings[next_index] * blend
+    bank = banks[base_index] * (1.0 - blend) + banks[next_index] * blend
+    return heading, bank
+
+
 @lru_cache(maxsize=128)
 def _cached_ramp_segments(config: SimulationConfig) -> tuple[RampSegment, ...]:
-    segment_count = len(config.segment_headings_deg)
+    segment_count = len(config.segment_headings_deg) * TRACK_SEGMENT_SUBDIVISIONS
     segment_length = config.length / segment_count
     current_point = Vec3(0.0, 0.0, config.height)
     segments: list[RampSegment] = []
-    for index, heading_deg in enumerate(config.segment_headings_deg):
+    for index in range(segment_count):
+        heading_deg, bank_deg = _interpolated_track_angles(
+            config.segment_headings_deg,
+            config.segment_bank_deg,
+            index,
+            segment_count,
+        )
         start_distance = segment_length * index
         segments.append(
             RampSegment(
                 start_distance=start_distance,
                 length=segment_length,
                 heading_deg=heading_deg,
+                bank_deg=bank_deg,
                 start_point=Vec3(current_point),
             )
         )
@@ -281,20 +366,60 @@ def ramp_segment_at_distance(config: SimulationConfig, distance_along_ramp: floa
 
 
 def path_distance_for_position(config: SimulationConfig, position: Vec3) -> float:
+    return _path_distance_for_position(config, position)
+
+
+def _path_distance_for_position(
+    config: SimulationConfig,
+    position: Vec3,
+    *,
+    reference_distance: float | None = None,
+    search_radius_segments: int | None = None,
+) -> float:
+    segments = build_ramp_segments(config)
+    if reference_distance is None or search_radius_segments is None:
+        candidate_segments = segments
+    else:
+        segment_length = config.length / max(1, len(segments))
+        center_index = min(
+            len(segments) - 1,
+            max(0, int(max(0.0, min(config.length - 1e-6, reference_distance)) / segment_length)),
+        )
+        start_index = max(0, center_index - search_radius_segments)
+        end_index = min(len(segments), center_index + search_radius_segments + 1)
+        candidate_segments = segments[start_index:end_index]
     best_distance = 0.0
     best_score = float("inf")
-    for segment in build_ramp_segments(config):
-        tangent = ramp_tangent(config, segment.start_distance)
+    for segment in candidate_segments:
+        tangent = heading_tangent_vector(config, segment.heading_deg)
         side = ramp_side(config, segment.start_distance)
+        normal = ramp_normal(config, segment.start_distance)
         relative = position - segment.start_point
         longitudinal = max(0.0, min(segment.length, relative.dot(tangent)))
-        lateral = relative.dot(side)
-        vertical = relative.z + longitudinal * sin(config.angle_rad)
-        score = abs(lateral) + abs(vertical) * 0.35
+        surface_point = segment.start_point + tangent * longitudinal
+        local_relative = position - surface_point
+        lateral = local_relative.dot(side)
+        vertical = local_relative.dot(normal)
+        score = lateral * lateral + vertical * vertical
         if score < best_score:
             best_score = score
             best_distance = segment.start_distance + longitudinal
     return best_distance
+
+
+def path_distance_for_position_near(
+    config: SimulationConfig,
+    position: Vec3,
+    reference_distance: float,
+    *,
+    search_radius_segments: int = 24,
+) -> float:
+    return _path_distance_for_position(
+        config,
+        position,
+        reference_distance=reference_distance,
+        search_radius_segments=search_radius_segments,
+    )
 
 
 def lateral_offset_for_position(config: SimulationConfig, position: Vec3) -> float:
@@ -392,25 +517,28 @@ def section_distance_ranges(config: SimulationConfig) -> tuple[tuple[SectionBlue
 
 
 def default_boost_pads(config: SimulationConfig) -> tuple[BoostPad, ...]:
-    boost_width = min(config.width - 0.42, 1.18)
+    boost_width = min(config.width - 0.26, 1.52)
     return (
-        BoostPad(config.length * 0.12, 0.0, 1.55, boost_width, 5.6),
-        BoostPad(config.length * 0.38, 0.0, 1.65, boost_width, 6.1),
-        BoostPad(config.length * 0.62, 0.0, 1.75, boost_width, 6.6),
-        BoostPad(config.length * 0.86, 0.0, 1.85, boost_width, 7.0),
+        BoostPad(config.length * 0.12, 0.0, 1.60, boost_width, 5.7),
+        BoostPad(config.length * 0.33, 0.0, 1.74, boost_width, 6.1),
+        BoostPad(config.length * 0.55, 0.0, 1.86, boost_width, 6.6),
+        BoostPad(config.length * 0.77, 0.0, 1.94, boost_width, 7.0),
+        BoostPad(config.length * 0.91, 0.0, 2.00, boost_width, 7.4),
     )
 
 
 def fixed_showcase_obstacles(config: SimulationConfig) -> tuple[GuideObstacle, ...]:
     return (
-        GuideObstacle(config.length * 0.20, -0.34, 0.92, 0.30, 0.24, 0.0, "block"),
-        GuideObstacle(config.length * 0.28, 0.30, 0.92, 0.30, 0.24, 0.0, "block"),
-        GuideObstacle(config.length * 0.43, -0.30, 0.82, 0.30, 0.24, 0.0, "block"),
-        GuideObstacle(config.length * 0.51, 0.34, 0.82, 0.30, 0.24, 0.0, "block"),
-        GuideObstacle(config.length * 0.68, 0.0, 1.02, 0.30, 0.26, 6.0, "block"),
-        GuideObstacle(config.length * 0.74, 0.30, 0.84, 0.30, 0.24, 0.0, "block"),
-        GuideObstacle(config.length * 0.83, -0.30, 0.84, 0.30, 0.24, 0.0, "block"),
-        GuideObstacle(config.length * 0.90, 0.0, 0.90, 0.28, 0.24, 0.0, "block"),
+        GuideObstacle(config.length * 0.18, -0.34, 0.96, 0.30, 0.24, 0.0, "block"),
+        GuideObstacle(config.length * 0.24, 0.32, 0.92, 0.30, 0.24, 0.0, "block"),
+        GuideObstacle(config.length * 0.39, -0.30, 0.84, 0.30, 0.24, 4.0, "block"),
+        GuideObstacle(config.length * 0.46, 0.34, 0.84, 0.30, 0.24, -4.0, "block"),
+        GuideObstacle(config.length * 0.58, 0.0, 1.08, 0.30, 0.26, 8.0, "block"),
+        GuideObstacle(config.length * 0.66, -0.30, 0.86, 0.30, 0.24, 0.0, "block"),
+        GuideObstacle(config.length * 0.72, 0.32, 0.86, 0.30, 0.24, 0.0, "block"),
+        GuideObstacle(config.length * 0.82, -0.28, 0.82, 0.28, 0.24, 0.0, "block"),
+        GuideObstacle(config.length * 0.87, 0.28, 0.82, 0.28, 0.24, 0.0, "block"),
+        GuideObstacle(config.length * 0.94, 0.0, 0.92, 0.28, 0.24, 0.0, "block"),
     )
 
 
@@ -530,6 +658,11 @@ def recommended_evaluation_time(
     return max(16.0, 6.8 + target_distance * 0.24 + total_obstacles * 0.50 + len(config.boost_pads) * 0.22)
 
 
+def ramp_exit_distance(config: SimulationConfig) -> float:
+    segment_length = config.length / max(1, len(build_ramp_segments(config)))
+    return config.length - max(config.marble_radius, segment_length * 1.40)
+
+
 def evaluate_course(
     config: SimulationConfig,
     *,
@@ -565,14 +698,11 @@ def evaluate_course(
             airborne_steps += 1
         if snapshot.boost_pad_index is not None:
             activated_boosts.add(snapshot.boost_pad_index)
-        if (
-            step_index > stall_steps
-            and snapshot.path_distance < config.length - config.marble_radius
-            and snapshot.speed < stall_speed
-        ):
+        exit_distance = ramp_exit_distance(config)
+        if step_index > stall_steps and snapshot.path_distance < exit_distance and snapshot.speed < stall_speed:
             stalled = True
             break
-        if snapshot.path_distance >= config.length - config.marble_radius:
+        if snapshot.path_distance >= exit_distance:
             break
 
     return CourseEvaluation(
@@ -583,7 +713,7 @@ def evaluate_course(
         max_impact_severity=max_impact_severity,
         airborne_fraction=(airborne_steps / total_steps) if total_steps else 0.0,
         stalled=stalled,
-        exited_ramp=max_distance >= config.length - config.marble_radius,
+        exited_ramp=max_distance >= ramp_exit_distance(config),
     )
 
 
@@ -927,12 +1057,14 @@ class MarbleRampSimulation:
         self._cached_impact_severity = 0.0
         self._cached_airborne = False
         self._cached_lateral_speed = 0.0
+        self._cached_path_distance = 0.0
 
         self.ground_np, self.ground_body = self._create_ground()
         self.ramp_nodes = self._create_ramp()
         self.rail_nodes = self._create_rails()
         self.obstacle_nodes = self._create_obstacles()
         self.marble_np, self.marble_body = self._create_marble()
+        self._cached_path_distance = path_distance_for_position(self.config, self.marble_np.getPos())
         self._refresh_motion_signals(1.0 / 120.0, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
 
     def _create_ground(self) -> tuple[NodePath, BulletRigidBodyNode]:
@@ -962,8 +1094,7 @@ class MarbleRampSimulation:
             body.setRestitution(self.config.restitution)
             node_path = self.root.attachNewNode(body)
             node_path.setPos(ramp_center_position(self.config, segment))
-            node_path.setH(segment.heading_deg)
-            node_path.setR(self.config.angle_deg)
+            node_path.setHpr(segment.heading_deg, segment.bank_deg, self.config.angle_deg)
             self.world.attachRigidBody(body)
             ramp_nodes.append((node_path, body, segment))
         return ramp_nodes
@@ -988,8 +1119,7 @@ class MarbleRampSimulation:
                 body.setRestitution(self.config.restitution)
                 node_path = self.root.attachNewNode(body)
                 node_path.setPos(rail_center_position(self.config, segment, offset))
-                node_path.setH(segment.heading_deg)
-                node_path.setR(self.config.angle_deg)
+                node_path.setHpr(segment.heading_deg, segment.bank_deg, self.config.angle_deg)
                 self.world.attachRigidBody(body)
                 rails.append((node_path, body, segment, offset))
         return rails
@@ -1005,8 +1135,8 @@ class MarbleRampSimulation:
             body.setRestitution(self.config.restitution)
             node_path = self.root.attachNewNode(body)
             node_path.setPos(obstacle_center_position(self.config, obstacle))
-            node_path.setH(obstacle.heading_deg)
-            node_path.setR(self.config.angle_deg)
+            segment = ramp_segment_at_distance(self.config, obstacle.distance_along_ramp)
+            node_path.setHpr(segment.heading_deg + obstacle.heading_deg, segment.bank_deg, self.config.angle_deg)
             self.world.attachRigidBody(body)
             obstacle_nodes.append((node_path, body, obstacle))
         return obstacle_nodes
@@ -1024,7 +1154,7 @@ class MarbleRampSimulation:
 
         node_path = self.root.attachNewNode(body)
         start_pos = ramp_surface_point(self.config, 0.0) + ramp_normal(self.config) * (
-            self.config.marble_radius + 0.005
+            self.config.marble_radius + MARBLE_START_SURFACE_CLEARANCE
         )
         node_path.setPos(start_pos)
         self.world.attachRigidBody(body)
@@ -1036,14 +1166,25 @@ class MarbleRampSimulation:
         self.brake_input = 0.0
         self.active_boost_pad_index = None
         start_pos = ramp_surface_point(self.config, 0.0) + ramp_normal(self.config) * (
-            self.config.marble_radius + 0.005
+            self.config.marble_radius + MARBLE_START_SURFACE_CLEARANCE
         )
         self.marble_np.setPos(start_pos)
         self.marble_np.setQuat(NodePath("identity").getQuat())
         self.marble_body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
         self.marble_body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
         self.marble_body.clearForces()
+        self._cached_path_distance = path_distance_for_position(self.config, self.marble_np.getPos())
         self._refresh_motion_signals(1.0 / 120.0, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
+
+    def settle_start_contact(self, *, settle_steps: int = 48, dt: float = 1.0 / 960.0) -> None:
+        if settle_steps <= 0 or dt <= 0.0:
+            return
+        for _ in range(settle_steps):
+            self.world.doPhysics(dt, 1, dt)
+        self.marble_body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
+        self.marble_body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
+        self.marble_body.clearForces()
+        self._refresh_motion_signals(dt, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
 
     def set_steering_input(self, lateral_input: float) -> None:
         self.steering_input = max(-1.0, min(1.0, lateral_input))
@@ -1087,7 +1228,7 @@ class MarbleRampSimulation:
         if active_boost is None:
             return
         _, boost_pad = active_boost
-        path_distance = path_distance_for_position(self.config, self.marble_np.getPos())
+        path_distance = self._current_path_distance()
         boost_direction = ramp_tangent(self.config, path_distance)
         if boost_direction.length_squared() <= 1e-9:
             return
@@ -1098,7 +1239,7 @@ class MarbleRampSimulation:
 
     def active_boost_pad(self) -> tuple[int, BoostPad] | None:
         position = self.marble_np.getPos()
-        path_distance = path_distance_for_position(self.config, position)
+        path_distance = self._current_path_distance()
         for index, boost_pad in enumerate(self.config.boost_pads):
             if abs(path_distance - boost_pad.distance_along_ramp) > boost_pad.length * 0.5:
                 continue
@@ -1117,7 +1258,7 @@ class MarbleRampSimulation:
     ) -> None:
         self._cached_obstacle_contacts = self.obstacle_contact_counts()
         self._cached_rail_contacts = self.rail_contact_count()
-        path_distance = path_distance_for_position(self.config, self.marble_np.getPos())
+        path_distance = self._current_path_distance()
         side = ramp_side(self.config, path_distance)
         normal = ramp_normal(self.config, path_distance)
         surface_point = ramp_surface_point(self.config, path_distance)
@@ -1157,7 +1298,7 @@ class MarbleRampSimulation:
         return SimulationSnapshot(
             time=self.time,
             position=self.marble_np.getPos(),
-            path_distance=path_distance_for_position(self.config, self.marble_np.getPos()),
+            path_distance=self._current_path_distance(),
             linear_velocity=self.marble_body.getLinearVelocity(),
             angular_velocity=self.marble_body.getAngularVelocity(),
             boost_active=self.active_boost_pad_index is not None,
@@ -1174,3 +1315,16 @@ class MarbleRampSimulation:
             self.world.contactTestPair(self.marble_body, obstacle_body).getNumContacts()
             for _, obstacle_body, _ in self.obstacle_nodes
         )
+
+    def _current_path_distance(self) -> float:
+        candidate_distance = path_distance_for_position_near(
+            self.config,
+            self.marble_np.getPos(),
+            self._cached_path_distance,
+        )
+        forward_progress = max(0.0, min(self.config.length, self.marble_np.getX()))
+        if self.marble_body.getLinearVelocity().length_squared() > 0.09:
+            self._cached_path_distance = max(self._cached_path_distance, candidate_distance, forward_progress)
+        else:
+            self._cached_path_distance = max(candidate_distance, forward_progress)
+        return self._cached_path_distance
