@@ -85,7 +85,7 @@ class SimulationConfig:
     rail_height: float = 0.46
     rail_width: float = 0.16
     steering_acceleration: float = 4.0
-    brake_drag: float = 3.0
+    brake_drag: float = 1.2
     obstacle_count: int = 10
     course_seed: int = 7
     auto_boost_pads: bool = True
@@ -1218,9 +1218,11 @@ class MarbleRampSimulation:
     def _apply_brake_drag(self, dt: float) -> None:
         if self.brake_input <= 1e-6 or self.config.brake_drag <= 0.0:
             return
-        damping = exp(-self.config.brake_drag * self.brake_input * dt)
-        self.marble_body.setLinearVelocity(self.marble_body.getLinearVelocity() * damping)
-        self.marble_body.setAngularVelocity(self.marble_body.getAngularVelocity() * damping)
+        brake_amount = self.brake_input * self.brake_input
+        linear_damping = exp(-self.config.brake_drag * brake_amount * dt)
+        angular_damping = exp(-self.config.brake_drag * brake_amount * dt * 0.45)
+        self.marble_body.setLinearVelocity(self.marble_body.getLinearVelocity() * linear_damping)
+        self.marble_body.setAngularVelocity(self.marble_body.getAngularVelocity() * angular_damping)
 
     def _apply_boost_pad(self, dt: float) -> None:
         active_boost = self.active_boost_pad()

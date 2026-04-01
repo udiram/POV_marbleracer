@@ -2,9 +2,11 @@ from marbleracer.gameplay import (
     build_course_sections,
     format_delta,
     format_seconds,
+    grade_time_trial,
     grade_run,
     rate_section,
 )
+from marbleracer.levels import LevelTargetTimes
 
 
 def test_sections_are_sorted_varied_and_within_course_length() -> None:
@@ -54,3 +56,13 @@ def test_time_formatters_handle_short_long_and_delta_times() -> None:
     assert format_seconds(71.2) == "1:11.20"
     assert format_delta(0.42) == "+0.42s"
     assert format_delta(-0.42) == "-0.42s"
+
+
+def test_time_trial_grade_uses_explicit_target_times() -> None:
+    targets = LevelTargetTimes(gold=10.0, silver=11.5, bronze=13.0)
+
+    assert grade_time_trial(9.2, targets).medal == "PLATINUM"
+    assert grade_time_trial(10.0, targets).medal == "GOLD"
+    assert grade_time_trial(11.2, targets).medal == "SILVER"
+    assert grade_time_trial(12.8, targets).medal == "BRONZE"
+    assert grade_time_trial(14.0, targets).medal == "NONE"

@@ -1,6 +1,52 @@
 # Panda3D Marble Ramp Simulation
 
-This project renders a single marble rolling down a long desk-style ramp in Panda3D with an explicit rigid-body model for a solid sphere rolling without slipping. The default scene now uses a seeded obstacle-course generator that builds mixed obstacle patterns and rejects layouts the marble cannot clear.
+This project renders a marble rolling down desk-style ramps in Panda3D with an explicit rigid-body model for a solid sphere rolling without slipping. The game now includes a track-select menu, local progression, medal targets, and personal-best ghost playback on saved levels.
+
+## Play
+
+Use the repo virtualenv or install the package in editable mode before running tests or the CLI:
+
+```bash
+./.venv/bin/python -m pytest -q
+./.venv/bin/python -m marbleracer.main
+```
+
+The main game supports:
+
+- track select menu across saved levels
+- local unlocks, best times, and medals in `.marbleracer_progress.json`
+- personal-best ghost playback on subsequent runs
+- direct launch into a specific level with `--menu-disabled`
+
+```bash
+marbleracer
+marbleracer --level default --menu-disabled
+marbleracer --reset-progress
+```
+
+## Level Builder
+
+You can now author reusable level files that define only:
+
+- the track shape and dimensions
+- boost pads
+- obstacles
+
+Saved levels live in [`levels/`](/Users/udbhavram/Documents/GitHub/POV_marbleracer/levels) as JSON and can be loaded into the game whenever needed.
+
+```bash
+marbleracer-builder
+marbleracer --list-levels
+marbleracer --level default
+marbleracer --level levels/my-custom-run.json
+```
+
+The current shipped builder is a 2D path editor backed by level JSON:
+
+- draw and drag track control points on a spline canvas
+- adjust start height, end height, and track width
+- save and reopen levels without losing the drawn path
+- launch the current level directly into the game
 
 ## Physics model
 
@@ -31,7 +77,62 @@ print(len(config.obstacles), result.exited_ramp, result.obstacle_hits)
 ```bash
 ./run_sim.sh
 ./run_sim.sh --obstacle-count 10 --course-seed 11
+marbleracer --level default
 ```
+
+## Learning and optimization
+
+The simulator now exposes a headless training layer in `marbleracer.optimization`.
+It treats each candidate as a piecewise-constant control plan over the existing `steering` and `brake` inputs, scores each rollout by finish time, and uses a genetic algorithm to evolve better runs over generations.
+
+This is the right first baseline for the current project for two reasons:
+
+- The control surface is effectively continuous: `steering` spans `[-1, 1]` and `brake` spans `[0, 1]`.
+- Vanilla DQN was introduced for discrete action settings, so using it here would mean hard-discretizing the controls and losing precision.
+
+For a true RL agent instead of open-loop search, the most natural next algorithms are:
+
+- `SAC` for sample-efficient continuous control.
+- `PPO` for a simpler, more stable on-policy baseline.
+
+The new environment already supports both continuous actions and a small discrete action map for experimentation, so a future Gym wrapper can attach cleanly.
+
+```bash
+python3 -m marbleracer.optimization --generations 20 --population-size 48
+marbleracer-train --course-seed 11 --population-size 64 --generations 30 --output best-plan.json
+```
+
+The reward is completion-time driven:
+
+- Each control step pays a small time penalty.
+- Forward progress adds reward while the marble is still racing.
+- Completing the course adds a terminal bonus scaled so earlier finishes score better than slower finishes.
+- Off-track and stall failures receive terminal penalties.
+
+## Visual training mode
+
+For project demos, use the visual training runner in `marbleracer.training_viz`.
+It renders a full population of marbles on the same track at once, highlights the current leader, advances generation by generation, and draws live training charts in the HUD.
+
+It can also export presentation artifacts:
+
+- `training_summary.json` with run configuration and per-generation metrics
+- `generation_history.csv` for report figures or external plotting
+- optional `frames/` screenshots for every rendered frame
+- optional `training_run.mp4` if `ffmpeg` is installed
+
+```bash
+marbleracer --train-viz --level default
+marbleracer --train-viz --population-size 24 --elite-count 6 --generations 12
+marbleracer-train-viz --level levels/my-custom-run.json --output-dir artifacts/demo --capture-frames --compile-video --auto-close
+```
+
+The visual mode is intentionally presentation-oriented:
+
+- every marble in the current population is shown on the level simultaneously
+- the leading marble is called out with a brighter halo
+- end-of-generation selection carries elites forward into the next population
+- the run history chart shows best and mean reward over time while the population chart shows current-generation progress
 
 ## Controls
 

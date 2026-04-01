@@ -1,0 +1,65 @@
+{
+  "name": "Time Trial Short",
+  "description": "Short sprint with clean racing lines and fast medal targets.",
+  "metadata": {
+    "difficulty": "easy",
+    "theme": "speed",
+    "unlock_index": 0,
+    "target_times": {
+      "gold": 8.0,
+      "silver": 9.2,
+      "bronze": 10.6
+    }
+  },
+  "track": {
+    "angle_deg": 14.2,
+    "length": 38.0,
+    "height": 12.6,
+    "width": 2.32,
+    "segment_headings_deg": [
+      0.0,
+      1.5,
+      3.0,
+      4.0,
+      4.0,
+      2.0,
+      -1.0,
+      -3.0,
+      -3.0,
+      -1.5,
+      0.0,
+      1.0
+    ],
+    "segment_bank_deg": [
+      0.0,
+      1.0,
+      2.0,
+      3.0,
+      3.0,
+      2.0,
+      -1.0,
+      -2.0,
+      -2.0,
+      -1.0,
+      0.0,
+      0.0
+    ]
+  },
+  "boost_pads": [
+    {
+      "distance_along_ramp": 9.0,
+      "lateral_offset": 0.0,
+      "length": 1.2,
+      "width": 1.0,
+      "acceleration": 6.0
+    },
+    {
+      "distance_along_ramp": 26.0,
+      "lateral_offset": 0.1,
+      "length": 1.3,
+      "width": 0.9,
+      "acceleration": 6.2
+    }
+  ],
+  "obstacles": []
+}

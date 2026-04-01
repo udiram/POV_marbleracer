@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from math import ceil, exp, sin
 from pathlib import Path
@@ -13,6 +14,7 @@ from panda3d.core import (
     CardMaker,
     DirectionalLight,
     Fog,
+    KeyboardButton,
     NodePath,
     PNMImage,
     PointLight,
@@ -30,9 +32,11 @@ from .gameplay import (
     build_course_sections,
     format_delta,
     format_seconds,
+    grade_time_trial,
     grade_run,
     rate_section,
 )
+from .levels import TrackLevel, level_from_config, level_to_config, list_levels
 from .physics import (
     GuideObstacle,
     MarbleRampSimulation,
@@ -45,6 +49,7 @@ from .physics import (
     ramp_surface_point,
     ramp_tangent,
 )
+from .progress import GhostSample, load_progress, save_progress, update_level_progress
 
 try:
     import simplepbr
@@ -134,12 +139,54 @@ class BoostPadVisual:
     pulse: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class LevelRuntime:
+    key: str
+    level: TrackLevel
+    config: SimulationConfig
+
+
+@dataclass(slots=True)
+class GhostPlayback:
+    samples: tuple[GhostSample, ...]
+    root: NodePath
+    marker: NodePath
+
+
 class MarbleRampApp(ShowBase):
-    def __init__(self, config: SimulationConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: SimulationConfig | None = None,
+        *,
+        levels: tuple[TrackLevel, ...] | None = None,
+        initial_level: str | None = None,
+        menu_disabled: bool = False,
+    ) -> None:
         super().__init__()
-        self.sim_config = config or SimulationConfig()
+        loaded_levels = tuple(levels or list_levels())
+        if not loaded_levels:
+            loaded_levels = (level_from_config(config or SimulationConfig(), name="Quick Run"),)
+        self.levels = tuple(
+            LevelRuntime(
+                key=level.name.lower().replace(" ", "-"),
+                level=level,
+                config=level_to_config(level),
+            )
+            for level in loaded_levels
+        )
+        self.progress = load_progress()
+        self.selected_level_index = 0
+        self.level_index = 0
+        initial_level_index = self._find_level_index(initial_level)
+        if initial_level_index is not None:
+            self.selected_level_index = initial_level_index
+            self.level_index = initial_level_index
+        self.level_runtime = self.levels[self.level_index]
+        self.sim_config = self.level_runtime.config if config is None else config
         self.simulation = MarbleRampSimulation(self.sim_config)
         self.simulation.settle_start_contact()
+        self.menu_disabled = menu_disabled
+        self.enable_fancy_rendering = os.environ.get("MARBLERACER_FANCY_RENDERING", "").strip() == "1"
         self.paused = False
         self.camera_follow_distance = 7.4
         self.camera_height = 5.2
@@ -170,6 +217,9 @@ class MarbleRampApp(ShowBase):
         self.camera_roll = 0.0
         self.steering_input = 0.0
         self.brake_input = 0.0
+        self.primary_action_pending = False
+        self._space_key_down = False
+        self._enter_key_down = False
         self.prop_spinners: list[NodePath] = []
         self.speed_lines: list[NodePath] = []
         self.pulse_nodes: list[PulseNode] = []
@@ -183,6 +233,7 @@ class MarbleRampApp(ShowBase):
         self.session_best_time: float | None = None
         self.finish_time: float | None = None
         self.finish_grade = None
+        self.failure_reason: str | None = None
         self.major_impacts = 0
         self.section_major_impacts = 0
         self.run_stability_loss = 0.0
@@ -206,6 +257,10 @@ class MarbleRampApp(ShowBase):
         self.flash_color = Vec4(0.96, 0.42, 0.18, 0.0)
         self.boost_flash = 0.0
         self.finish_flash = 0.0
+        self.ghost_playback: GhostPlayback | None = None
+        self.pending_ghost_samples: list[GhostSample] = []
+        self._last_ghost_sample_time = 0.0
+        self._stall_timer = 0.0
         self.current_section_name = self.course_sections[0].name
         self.current_section_focus = self.course_sections[0].focus
         start_pos = self.simulation.snapshot().position
@@ -218,14 +273,98 @@ class MarbleRampApp(ShowBase):
         self._build_world()
         self._build_ui()
         self._setup_input()
+        self._load_level_progress()
         self._reset_run_state()
-        self._enter_title_state()
+        if self.menu_disabled:
+            self._start_selected_level()
+        else:
+            self._enter_menu_state()
         self.taskMgr.add(self._tick, "marble-ramp-tick")
         self._apply_state()
 
     @property
-    def finish_line_x(self) -> float:
-        return self.sim_config.length - 1.0
+    def finish_line_distance(self) -> float:
+        return max(0.0, self.sim_config.length - max(0.08, self.sim_config.marble_radius * 0.35))
+
+    @property
+    def current_level(self) -> TrackLevel:
+        return self.level_runtime.level
+
+    @property
+    def current_level_key(self) -> str:
+        return self.level_runtime.key
+
+    def _find_level_index(self, level_ref: str | None) -> int | None:
+        if level_ref is None:
+            return None
+        normalized = level_ref.strip().lower()
+        for index, runtime in enumerate(self.levels):
+            if normalized in {runtime.key, runtime.level.name.lower()}:
+                return index
+        return None
+
+    def _is_level_unlocked(self, index: int) -> bool:
+        runtime = self.levels[index]
+        progress_entry = self.progress.levels.get(runtime.key)
+        return runtime.level.unlock_index == 0 or (progress_entry is not None and progress_entry.unlocked)
+
+    def _load_level_progress(self) -> None:
+        progress_entry = self.progress.levels.get(self.current_level_key)
+        self.session_best_time = progress_entry.best_time if progress_entry is not None else None
+        self._load_ghost(progress_entry.ghost if progress_entry is not None else ())
+
+    def _load_runtime_level(self, index: int, *, reset_selection: bool = True) -> None:
+        self.level_index = index
+        if reset_selection:
+            self.selected_level_index = index
+        self.level_runtime = self.levels[index]
+        self.sim_config = self.level_runtime.config
+        self.simulation = MarbleRampSimulation(self.sim_config)
+        self.simulation.settle_start_contact()
+        self.course_sections = build_course_sections(self.sim_config.length)
+        self.boost_pads = []
+        self.pulse_nodes = []
+        self.speed_lines = []
+        self.prop_spinners = []
+        if hasattr(self, "scene_root") and not self.scene_root.isEmpty():
+            self.scene_root.removeNode()
+        self._build_world()
+        if hasattr(self, "finish_glow_np") and not self.finish_glow_np.isEmpty():
+            finish_point = ramp_surface_point(self.sim_config, self.finish_line_distance)
+            self.finish_glow_np.setPos(finish_point.x, finish_point.y, finish_point.z + 3.2)
+        self._load_level_progress()
+        self._reset()
+
+    def _start_selected_level(self) -> None:
+        self._load_runtime_level(self.selected_level_index)
+
+    def _unlock_next_level(self) -> None:
+        next_index = self.level_index + 1
+        if next_index >= len(self.levels):
+            return
+        next_level = self.levels[next_index]
+        self.progress = update_level_progress(self.progress, next_level.key, unlocked=True)
+        save_progress(self.progress)
+
+    def _enter_menu_state(self) -> None:
+        self.race_phase = "menu"
+        self.paused = False
+        self.failure_reason = None
+        self.selected_level_index = self.level_index
+        self._show_event(
+            "TRACK SELECT",
+            "Up/Down choose   Enter start   R reset progress",
+            Vec4(0.92, 0.94, 0.98, 1.0),
+            hold=60.0,
+        )
+
+    def _enter_failed_state(self, reason: str, subtitle: str) -> None:
+        self.race_phase = "failed"
+        self.failure_reason = reason
+        self.current_section_name = "Run Failed"
+        self.current_section_focus = subtitle
+        self._show_event(reason, subtitle, Vec4(0.96, 0.42, 0.18, 1.0), hold=60.0)
+        self._trigger_flash(Vec4(0.96, 0.42, 0.18, 1.0), 0.22)
 
     def _setup_window(self) -> None:
         props = WindowProperties()
@@ -235,10 +374,11 @@ class MarbleRampApp(ShowBase):
             self.win.requestProperties(props)
         self.setBackgroundColor(0.02, 0.03, 0.05, 1.0)
         self.render.setAntialias(AntialiasAttrib.MAuto)
-        self.render.setShaderAuto()
         if patch_loader is not None:
             patch_loader(self.loader)
-        if simplepbr is not None and self.win is not None:
+        if self.enable_fancy_rendering:
+            self.render.setShaderAuto()
+        if self.enable_fancy_rendering and simplepbr is not None and self.win is not None:
             simplepbr.init(enable_shadows=False, use_occlusion_maps=False, max_lights=8)
         self.filters = None
 
@@ -266,9 +406,10 @@ class MarbleRampApp(ShowBase):
 
         finish_glow = PointLight("finish-glow")
         finish_glow.setColor(Vec4(0.32, 0.58, 0.82, 1.0))
-        finish_glow_np = self.render.attachNewNode(finish_glow)
-        finish_glow_np.setPos(self.sim_config.length - 1.5, 0.0, 3.2)
-        self.render.setLight(finish_glow_np)
+        finish_point = ramp_surface_point(self.sim_config, self.finish_line_distance)
+        self.finish_glow_np = self.render.attachNewNode(finish_glow)
+        self.finish_glow_np.setPos(finish_point.x, finish_point.y, finish_point.z + 3.2)
+        self.render.setLight(self.finish_glow_np)
 
     def _build_world(self) -> None:
         self.scene_root = self.render.attachNewNode("scene-root")
@@ -440,7 +581,8 @@ class MarbleRampApp(ShowBase):
         return heading, bank
 
     def _build_continuous_track_skin(self) -> None:
-        sample_count = max(64, len(self.simulation.ramp_segments) * 5)
+        # The original skin density was visually nice but far too expensive on laptop GPUs.
+        sample_count = max(24, len(self.simulation.ramp_segments))
         slice_length = self.sim_config.length / sample_count
         for index in range(sample_count):
             distance = min(self.sim_config.length - slice_length * 0.5, (index + 0.5) * slice_length)
@@ -512,7 +654,11 @@ class MarbleRampApp(ShowBase):
             )
             glow.setZ(self.sim_config.rail_height * 0.34)
 
-            for post_offset in (-segment.length * 0.32, 0.0, segment.length * 0.32):
+            if index % 3 == 0:
+                post_offsets = (0.0,)
+            else:
+                post_offsets = ()
+            for post_offset in post_offsets:
                 post = rail.attachNewNode("post")
                 self._attach_centered_box(
                     post,
@@ -660,7 +806,9 @@ class MarbleRampApp(ShowBase):
 
     def _build_finish_gate(self) -> None:
         gate = self.scene_root.attachNewNode("finish-gate")
-        gate.setPos(self.finish_line_x, 0.0, 0.0)
+        finish_distance = self.finish_line_distance
+        finish_point = ramp_surface_point(self.sim_config, finish_distance)
+        gate.setPos(finish_point)
         for side in (-1, 1):
             post = gate.attachNewNode(f"post-{side}")
             self._attach_centered_box(
@@ -1064,6 +1212,33 @@ class MarbleRampApp(ShowBase):
             )
             line.setPos(-self.sim_config.marble_radius * 1.1, 0.0, -0.02)
             self.speed_lines.append(line)
+        self._build_ghost_marker()
+
+    def _build_ghost_marker(self) -> None:
+        if self.ghost_playback is not None and not self.ghost_playback.root.isEmpty():
+            self.ghost_playback.root.removeNode()
+        ghost_root = self.scene_root.attachNewNode("ghost-root")
+        ghost_root.setTransparency(TransparencyAttrib.MAlpha)
+        ghost_root.setColorScale(0.36, 0.82, 0.98, 0.60)
+        ghost_root.setDepthWrite(False)
+        ghost_root.setBin("transparent", 30)
+        ghost_root.hide()
+        self._load_styled_model(
+            ghost_root,
+            "sphere",
+            scale=Vec3(self.sim_config.marble_radius * 0.96),
+            color=Vec4(0.36, 0.82, 0.98, 0.62),
+        )
+        marker = ghost_root.attachNewNode("ghost-marker")
+        self._load_styled_model(
+            marker,
+            "sphere",
+            scale=Vec3(self.sim_config.marble_radius * 0.24),
+            color=Vec4(0.98, 1.0, 1.0, 0.82),
+            pos=Vec3(self.sim_config.marble_radius * 1.02, 0.0, self.sim_config.marble_radius * 0.12),
+        )
+        samples = self.ghost_playback.samples if self.ghost_playback is not None else ()
+        self.ghost_playback = GhostPlayback(samples=samples, root=ghost_root, marker=marker)
 
     def _setup_camera(self) -> None:
         if self.camLens is None or self.camera is None:
@@ -1078,7 +1253,7 @@ class MarbleRampApp(ShowBase):
             align=TextNode.ALeft,
             scale=0.052,
             fg=(0.92, 0.94, 0.98, 1.0),
-            mayChange=False,
+            mayChange=True,
         )
         self.subtitle = OnscreenText(
             text="Long banked course. Sparse obstacles. Fast lines.",
@@ -1086,7 +1261,7 @@ class MarbleRampApp(ShowBase):
             align=TextNode.ALeft,
             scale=0.030,
             fg=(0.66, 0.72, 0.80, 1.0),
-            mayChange=False,
+            mayChange=True,
         )
         self.hud = OnscreenText(
             text="",
@@ -1137,7 +1312,7 @@ class MarbleRampApp(ShowBase):
             mayChange=True,
         )
         self.controls = OnscreenText(
-            text="Left/Right steer   Down brake   Space start/pause   R restart   Esc quit",
+            text="Up/Down menu   Left/Right steer   Down brake   Space start/pause   M menu   R restart   Esc quit",
             pos=(0.0, -0.94),
             scale=0.030,
             fg=(0.70, 0.74, 0.80, 1.0),
@@ -1186,15 +1361,38 @@ class MarbleRampApp(ShowBase):
         self.accept("arrow_left-up", self._release_steering, [1.0])
         self.accept("arrow_right", self._set_steering, [-1.0])
         self.accept("arrow_right-up", self._release_steering, [-1.0])
-        self.accept("arrow_down", self._set_brake, [1.0])
+        self.accept("arrow_up", self._on_up_press)
+        self.accept("arrow_down", self._on_down_press)
         self.accept("arrow_down-up", self._set_brake, [0.0])
-        self.accept("space", self._handle_space)
-        self.accept("r", self._reset)
-        self.accept("enter", self._handle_space)
+        self.accept("space", self._queue_primary_action)
+        self.accept("raw-space", self._queue_primary_action)
+        self.accept("r", self._handle_reset)
+        self.accept("enter", self._queue_primary_action)
+        self.accept("raw-enter", self._queue_primary_action)
+        self.accept("m", self._enter_menu_state)
         self.accept("tab", self._toggle_debug_overlay)
         self.accept("escape", self.userExit)
 
+    def _queue_primary_action(self) -> None:
+        self.primary_action_pending = True
+
+    def _handle_reset(self) -> None:
+        if self.race_phase == "menu":
+            self.progress = load_progress()
+            self.selected_level_index = 0
+            self._load_level_progress()
+            self._show_event(
+                "TRACK SELECT",
+                "Progress reset with --reset-progress only",
+                Vec4(0.92, 0.94, 0.98, 1.0),
+                hold=2.0,
+            )
+            return
+        self._reset()
+
     def _set_steering(self, direction: float) -> None:
+        if self.race_phase != "running":
+            return
         self.steering_input = direction
         self.simulation.set_steering_input(direction)
 
@@ -1204,11 +1402,34 @@ class MarbleRampApp(ShowBase):
             self.simulation.set_steering_input(0.0)
 
     def _set_brake(self, amount: float) -> None:
+        if self.race_phase != "running":
+            return
         self.brake_input = amount
         self.simulation.set_brake_input(amount)
 
+    def _on_up_press(self) -> None:
+        self._menu_move(-1)
+
+    def _on_down_press(self) -> None:
+        if self.race_phase == "menu":
+            self._menu_move(1)
+            return
+        self._set_brake(1.0)
+
+    def _menu_move(self, delta: int) -> None:
+        if self.race_phase != "menu":
+            return
+        self.selected_level_index = (self.selected_level_index + delta) % len(self.levels)
+
     def _handle_space(self) -> None:
-        if self.race_phase in {"title", "finished"}:
+        if self.race_phase == "menu":
+            if self._is_level_unlocked(self.selected_level_index):
+                self._start_selected_level()
+            return
+        if self.race_phase in {"finished", "failed"}:
+            self._reset()
+            return
+        if self.race_phase == "title":
             self._reset()
             return
         if self.race_phase == "running":
@@ -1216,6 +1437,17 @@ class MarbleRampApp(ShowBase):
             return
         if self.paused:
             self.paused = False
+
+    def _poll_primary_action_keys(self) -> None:
+        watcher = getattr(self, "mouseWatcherNode", None)
+        if watcher is None:
+            return
+        space_down = watcher.is_button_down(KeyboardButton.space())
+        enter_down = watcher.is_button_down(KeyboardButton.enter())
+        if (space_down and not self._space_key_down) or (enter_down and not self._enter_key_down):
+            self.primary_action_pending = True
+        self._space_key_down = space_down
+        self._enter_key_down = enter_down
 
     def _toggle_debug_overlay(self) -> None:
         self.debug_overlay_visible = not self.debug_overlay_visible
@@ -1229,6 +1461,47 @@ class MarbleRampApp(ShowBase):
     def _trigger_flash(self, color: Vec4, amount: float) -> None:
         self.flash_color = Vec4(color.x, color.y, color.z, max(self.flash_alpha, amount))
         self.flash_alpha = max(self.flash_alpha, amount)
+
+    def _load_ghost(self, samples: tuple[GhostSample, ...]) -> None:
+        if self.ghost_playback is None:
+            self.ghost_playback = GhostPlayback(
+                samples=samples,
+                root=NodePath("ghost-placeholder"),
+                marker=NodePath("ghost-placeholder-marker"),
+            )
+            return
+        self.ghost_playback.samples = samples
+        if samples and self.race_phase != "menu":
+            self.ghost_playback.root.show()
+        else:
+            self.ghost_playback.root.hide()
+
+    def _record_ghost_sample(self, time_s: float) -> None:
+        if self.race_phase != "running":
+            return
+        if self.pending_ghost_samples and time_s - self._last_ghost_sample_time < 0.05:
+            return
+        state = self.simulation.snapshot()
+        self.pending_ghost_samples.append(
+            GhostSample.from_vec3(time=time_s, path_distance=state.path_distance, position=state.position)
+        )
+        self._last_ghost_sample_time = time_s
+
+    def _update_ghost_playback(self, time_s: float) -> None:
+        if self.ghost_playback is None or not self.ghost_playback.samples:
+            return
+        if self.race_phase in {"menu", "failed"}:
+            self.ghost_playback.root.hide()
+            return
+        self.ghost_playback.root.show()
+        samples = self.ghost_playback.samples
+        current = samples[-1]
+        for sample in samples:
+            current = sample
+            if sample.time >= time_s:
+                break
+        ghost_position = Vec3(*current.position) + Vec3(0.0, 0.0, self.sim_config.marble_radius * 0.10)
+        self.ghost_playback.root.setPos(ghost_position)
 
     def _enter_title_state(self) -> None:
         self.race_phase = "title"
@@ -1248,6 +1521,7 @@ class MarbleRampApp(ShowBase):
         self.last_countdown_value = int(ceil(self.countdown_timer))
         self.finish_time = None
         self.finish_grade = None
+        self.failure_reason = None
         self.major_impacts = 0
         self.section_major_impacts = 0
         self.run_stability_loss = 0.0
@@ -1266,6 +1540,9 @@ class MarbleRampApp(ShowBase):
         self.flash_alpha = 0.0
         self.boost_flash = 0.0
         self.finish_flash = 0.0
+        self.pending_ghost_samples = []
+        self._last_ghost_sample_time = 0.0
+        self._stall_timer = 0.0
         self._show_event("3", "", Vec4(0.92, 0.94, 0.98, 1.0), hold=10.0)
         for pad in self.boost_pads:
             pad.spent = False
@@ -1292,6 +1569,7 @@ class MarbleRampApp(ShowBase):
         self.camera_focus = Vec3(start_pos)
         self.camera_look_target = Vec3(start_pos) + self.camera_forward * self.camera_look_ahead
         self._reset_run_state()
+        self._update_ghost_playback(0.0)
         self._apply_state(1.0 / 60.0)
 
     def _update_feedback_state(self, dt: float) -> None:
@@ -1356,23 +1634,48 @@ class MarbleRampApp(ShowBase):
     def _finish_run(self, state) -> None:
         if self.race_phase == "finished":
             return
+        if not self.pending_ghost_samples or self.pending_ghost_samples[-1].time < state.time:
+            self.pending_ghost_samples.append(
+                GhostSample.from_vec3(time=state.time, path_distance=state.path_distance, position=state.position)
+            )
         self.race_phase = "finished"
         self.current_section_name = "Finished"
         self.current_section_focus = ""
         self.finish_time = state.time
         previous_best = self.session_best_time
-        self.finish_grade = grade_run(
-            length=self.sim_config.length,
-            obstacle_count=len(self.sim_config.obstacles),
-            finish_time=state.time,
-            major_impacts=self.major_impacts,
-            clean_sections=self.clean_sections,
-            stability_loss=self.run_stability_loss,
-            boost_chain=self.best_boost_chain,
-        )
+        if self.current_level.target_times is not None:
+            self.finish_grade = grade_time_trial(state.time, self.current_level.target_times)
+        else:
+            self.finish_grade = grade_run(
+                length=self.sim_config.length,
+                obstacle_count=len(self.sim_config.obstacles),
+                finish_time=state.time,
+                major_impacts=self.major_impacts,
+                clean_sections=self.clean_sections,
+                stability_loss=self.run_stability_loss,
+                boost_chain=self.best_boost_chain,
+            )
         is_best = previous_best is None or state.time < previous_best
         if is_best:
             self.session_best_time = state.time
+            self.progress = update_level_progress(
+                self.progress,
+                self.current_level_key,
+                unlocked=True,
+                best_time=state.time,
+                best_medal=self.finish_grade.medal,
+                ghost=tuple(self.pending_ghost_samples),
+            )
+            save_progress(self.progress)
+        else:
+            self.progress = update_level_progress(
+                self.progress,
+                self.current_level_key,
+                unlocked=True,
+                best_medal=self.finish_grade.medal,
+            )
+            save_progress(self.progress)
+        self._unlock_next_level()
         subtitle = format_seconds(state.time)
         if is_best:
             subtitle += "   NEW BEST"
@@ -1397,12 +1700,21 @@ class MarbleRampApp(ShowBase):
             if active_index is not None and active_index < len(self.boost_pads):
                 self._activate_boost_pad(self.boost_pads[active_index], active_index)
 
-        if state.position.x >= self.finish_line_x:
+        if state.path_distance >= self.finish_line_distance:
             self._finish_run(state)
             return
 
         if self._should_reset_for_off_track(previous_state, state, dt):
-            self._reset()
+            self._enter_failed_state("OFF TRACK", "Press Space to retry   M for menu")
+            return
+
+        progress_delta = max(0.0, state.path_distance - previous_state.path_distance)
+        if progress_delta < 0.01 and state.speed < 0.35:
+            self._stall_timer += dt
+        else:
+            self._stall_timer = max(0.0, self._stall_timer - dt * 2.0)
+        if self._stall_timer >= 1.25:
+            self._enter_failed_state("STALLED", "Press Space to retry   M for menu")
             return
 
         speed_drop = max(0.0, previous_state.speed - state.speed - self.brake_input * 0.45)
@@ -1422,9 +1734,14 @@ class MarbleRampApp(ShowBase):
             self.section_major_impacts += 1
             self.impact_event_cooldown = 0.72
             self.boost_chain = 0
+        self._record_ghost_sample(state.time)
 
     def _tick(self, task: Task) -> int:
         dt = clamp_frame_dt(globalClock.getDt())
+        self._poll_primary_action_keys()
+        if self.primary_action_pending:
+            self.primary_action_pending = False
+            self._handle_space()
         self._update_feedback_state(dt)
         if not self.paused:
             if self.race_phase == "countdown":
@@ -1434,6 +1751,7 @@ class MarbleRampApp(ShowBase):
                 self.simulation.step(dt)
                 self._handle_running_state(previous_state, self.simulation.snapshot(), dt)
         self._animate_props(task.time, dt)
+        self._update_ghost_playback(self.simulation.snapshot().time)
         self._apply_state(dt)
         return Task.cont
 
@@ -1478,6 +1796,12 @@ class MarbleRampApp(ShowBase):
         self._update_camera(state, camera_dt)
         progress = min(100.0, (state.path_distance / self.sim_config.length) * 100.0)
         best_text = "--" if self.session_best_time is None else format_seconds(self.session_best_time)
+        medal_targets = self.current_level.target_times
+        self.title.setText(self.current_level.name)
+        subtitle = self.current_level.description or f"{self.current_level.difficulty.title()} {self.current_level.theme.title()} course."
+        if self.race_phase == "menu":
+            subtitle = "Playable demo build. Select a track and start."
+        self.subtitle.setText(subtitle)
         self.hud.setText(
             (
                 f"time   {format_seconds(state.time):>7}\n"
@@ -1485,23 +1809,38 @@ class MarbleRampApp(ShowBase):
                 f"track  {progress:5.1f}%"
             )
         )
-        self.status.setText("")
+        if medal_targets is not None:
+            medal_text = (
+                f"gold   {format_seconds(medal_targets.gold)}\n"
+                f"silver {format_seconds(medal_targets.silver)}\n"
+                f"bronze {format_seconds(medal_targets.bronze)}"
+            )
+        else:
+            medal_text = ""
+        self.status.setText(medal_text)
         if self.finish_grade is not None and self.finish_time is not None:
             self.result.setText(
                 (
-                    f"run   {format_seconds(self.finish_time)}\n"
-                    f"best  {best_text}"
+                    f"run    {format_seconds(self.finish_time)}\n"
+                    f"best   {best_text}\n"
+                    f"medal  {self.finish_grade.medal}"
                 )
             )
-            self.result.setFg((0.92, 0.94, 0.98, 1.0))
+            self.result.setFg((self.finish_grade.color[0], self.finish_grade.color[1], self.finish_grade.color[2], 1.0))
         else:
             self.result.setText("")
 
         center_text = self.event_text
         center_subtitle = self.event_subtitle
-        if self.race_phase == "title":
-            center_text = self.event_text
-            center_subtitle = self.event_subtitle
+        if self.race_phase == "menu":
+            selected = self.levels[self.selected_level_index]
+            selected_unlocked = self._is_level_unlocked(self.selected_level_index)
+            center_text = selected.level.name
+            lock_text = "" if selected_unlocked else "LOCKED   "
+            center_subtitle = (
+                f"{lock_text}{selected.level.difficulty.title()} / {selected.level.theme.title()}   "
+                f"Best {format_seconds(self.progress.levels.get(selected.key).best_time) if self.progress.levels.get(selected.key) and self.progress.levels.get(selected.key).best_time is not None else '--'}"
+            )
         if self.paused and self.race_phase == "running":
             center_text = "PAUSED"
             center_subtitle = "Space to resume   R to restart"
@@ -1512,7 +1851,22 @@ class MarbleRampApp(ShowBase):
         self.banner.setText(center_subtitle)
         self.center_message.setFg((self.event_color.x, self.event_color.y, self.event_color.z, 1.0))
         self.banner.setFg((self.event_color.x * 0.88, self.event_color.y * 0.92, self.event_color.z, 1.0))
-        self.progress_caption.setText("")
+        if self.race_phase == "menu":
+            lines = []
+            for index, runtime in enumerate(self.levels):
+                marker = ">" if index == self.selected_level_index else " "
+                unlocked = self._is_level_unlocked(index)
+                progress_entry = self.progress.levels.get(runtime.key)
+                medal = progress_entry.best_medal if progress_entry is not None else "NONE"
+                lines.append(f"{marker} {runtime.level.name}   {'OPEN' if unlocked else 'LOCKED'}   {medal}")
+            self.progress_caption.setText("\n".join(lines))
+        elif self.race_phase in {"finished", "failed"}:
+            action_text = "Space retry   M menu"
+            if self.level_index + 1 < len(self.levels) and self._is_level_unlocked(min(self.level_index + 1, len(self.levels) - 1)):
+                action_text += "   Enter retry"
+            self.progress_caption.setText(action_text)
+        else:
+            self.progress_caption.setText(f"{self.current_section_name}   {self.current_section_focus}")
         self.progress_fill.setScale(max(0.001, progress / 100.0), 1.0, 1.0)
         self.progress_fill.setColor(0.82, 0.84, 0.88, 0.95)
         if self.debug_overlay_visible:

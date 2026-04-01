@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .levels import LevelTargetTimes
 
 SECTION_TEMPLATES: tuple[
     tuple[str, str, float, float, tuple[float, float, float, float]],
@@ -141,6 +142,36 @@ def grade_run(
         adjusted_time=adjusted_time,
         target_time=thresholds[-1][1],
         color=MEDAL_COLORS["BRONZE"],
+    )
+
+
+def grade_time_trial(finish_time: float, target_times: LevelTargetTimes) -> RunGrade:
+    if finish_time < 0.0:
+        raise ValueError("Finish time must be non-negative.")
+    if finish_time <= target_times.gold * 0.93:
+        medal = "PLATINUM"
+        target_time = target_times.gold * 0.93
+    elif finish_time <= target_times.gold:
+        medal = "GOLD"
+        target_time = target_times.gold
+    elif finish_time <= target_times.silver:
+        medal = "SILVER"
+        target_time = target_times.silver
+    elif finish_time <= target_times.bronze:
+        medal = "BRONZE"
+        target_time = target_times.bronze
+    else:
+        return RunGrade(
+            medal="NONE",
+            adjusted_time=finish_time,
+            target_time=target_times.bronze,
+            color=(0.72, 0.76, 0.84, 1.0),
+        )
+    return RunGrade(
+        medal=medal,
+        adjusted_time=finish_time,
+        target_time=target_time,
+        color=MEDAL_COLORS[medal],
     )
 
 
