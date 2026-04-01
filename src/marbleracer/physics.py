@@ -1192,6 +1192,16 @@ class MarbleRampSimulation:
     def set_brake_input(self, brake_input: float) -> None:
         self.brake_input = max(0.0, min(1.0, brake_input))
 
+    def add_forward_speed(self, speed_delta: float) -> None:
+        if speed_delta <= 0.0:
+            return
+        path_distance = self._current_path_distance()
+        forward = ramp_tangent(self.config, path_distance)
+        if forward.length_squared() <= 1e-9:
+            return
+        forward.normalize()
+        self.marble_body.setLinearVelocity(self.marble_body.getLinearVelocity() + forward * speed_delta)
+
     def step(self, dt: float) -> SimulationSnapshot:
         dt = max(0.0, dt)
         if dt > 0.0:
@@ -1241,15 +1251,28 @@ class MarbleRampSimulation:
 
     def active_boost_pad(self) -> tuple[int, BoostPad] | None:
         position = self.marble_np.getPos()
-        path_distance = self._current_path_distance()
+        activation_margin = self.config.marble_radius
         for index, boost_pad in enumerate(self.config.boost_pads):
-            if abs(path_distance - boost_pad.distance_along_ramp) > boost_pad.length * 0.5:
-                continue
             center = boost_pad_center_position(self.config, boost_pad)
+            tangent = ramp_tangent(self.config, boost_pad.distance_along_ramp)
+            if tangent.length_squared() <= 1e-9:
+                continue
+            tangent.normalize()
             side = ramp_side(self.config, boost_pad.distance_along_ramp)
-            lateral_offset = abs((position - center).dot(side))
-            if lateral_offset <= boost_pad.width * 0.5:
-                return index, boost_pad
+            normal = ramp_normal(self.config, boost_pad.distance_along_ramp)
+            relative = position - center
+            longitudinal_offset = abs(relative.dot(tangent))
+            lateral_offset = abs(relative.dot(side))
+            normal_offset = relative.dot(normal)
+            if longitudinal_offset > boost_pad.length * 0.5 + activation_margin:
+                continue
+            if lateral_offset > boost_pad.width * 0.5 + activation_margin:
+                continue
+            if normal_offset < -0.12 or normal_offset > activation_margin * 1.8:
+                continue
+            if self._cached_airborne and normal_offset > activation_margin * 0.8:
+                continue
+            return index, boost_pad
         return None
 
     def _refresh_motion_signals(

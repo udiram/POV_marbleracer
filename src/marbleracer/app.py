@@ -42,6 +42,7 @@ from .physics import (
     MarbleRampSimulation,
     SimulationConfig,
     boost_pad_center_position,
+    is_position_off_track,
     obstacle_center_position,
     ramp_normal,
     ramp_segment_at_distance,
@@ -284,7 +285,7 @@ class MarbleRampApp(ShowBase):
 
     @property
     def finish_line_distance(self) -> float:
-        return max(0.0, self.sim_config.length - max(0.08, self.sim_config.marble_radius * 0.35))
+        return max(0.0, self.sim_config.length - max(0.60, self.sim_config.marble_radius * 2.2))
 
     @property
     def current_level(self) -> TrackLevel:
@@ -454,7 +455,7 @@ class MarbleRampApp(ShowBase):
             horizon.setH(90.0 - side * 24.0)
 
         aura = self.scene_root.attachNewNode("finish-aura")
-        self._attach_centered_box(aura, size=Vec3(2.8, 4.8, 0.04), color=Vec4(0.18, 0.22, 0.28, 1.0))
+        self._attach_centered_box(aura, size=Vec3(2.8, 4.8, 0.04), color=Vec4(0.15, 0.17, 0.20, 1.0))
         aura.setPos(self.sim_config.length - 1.2, 0.0, 0.08)
 
     def _build_ground(self) -> None:
@@ -490,7 +491,7 @@ class MarbleRampApp(ShowBase):
             self._attach_centered_box(
                 lane_light,
                 size=Vec3(0.75, 0.08, 0.012),
-                color=Vec4(0.18, 0.70, 0.94, 1.0),
+                color=Vec4(0.26, 0.32, 0.38, 1.0),
             )
             lane_light.setPos(2.4 + lane_index * 6.0, 0.0, 0.105)
 
@@ -581,7 +582,7 @@ class MarbleRampApp(ShowBase):
         return heading, bank
 
     def _build_continuous_track_skin(self) -> None:
-        # The original skin density was visually nice but far too expensive on laptop GPUs.
+        # Keep the continuity accents narrow so they do not z-fight with the main ramp mesh.
         sample_count = max(24, len(self.simulation.ramp_segments))
         slice_length = self.sim_config.length / sample_count
         for index in range(sample_count):
@@ -591,35 +592,27 @@ class MarbleRampApp(ShowBase):
             normal = ramp_normal(self.sim_config, distance)
 
             skin = self.scene_root.attachNewNode(f"track-skin-{index}")
-            skin.setPos(center + normal * 0.003)
+            skin.setPos(center + normal * 0.016)
             skin.setHpr(heading_deg, bank_deg, self.sim_config.angle_deg)
 
-            surface = skin.attachNewNode("surface")
-            self._attach_centered_box(
-                surface,
-                size=Vec3(slice_length * 1.10, self.sim_config.width * 0.86, 0.006),
-                color=Vec4(0.19, 0.20, 0.22, 1.0),
-                style="track",
-            )
-
-            lane = skin.attachNewNode("lane")
+            lane = skin.attachNewNode("lane-ribbon")
             self._attach_centered_box(
                 lane,
-                size=Vec3(slice_length * 1.06, self.sim_config.width * 0.10, 0.006),
-                color=Vec4(0.84, 0.86, 0.90, 1.0),
+                size=Vec3(slice_length * 0.96, self.sim_config.width * 0.045, 0.010),
+                color=Vec4(0.72, 0.74, 0.78, 1.0),
                 style="screen",
             )
-            lane.setZ(0.006)
+            lane.setZ(0.004)
 
             for side in (-1, 1):
                 trim = skin.attachNewNode(f"trim-{side}")
                 self._attach_centered_box(
                     trim,
-                    size=Vec3(slice_length * 1.06, 0.05, 0.024),
-                    color=Vec4(0.52, 0.58, 0.66, 1.0),
+                    size=Vec3(slice_length * 0.98, 0.032, 0.030),
+                    color=Vec4(0.38, 0.40, 0.44, 1.0),
                     style="screen",
                 )
-                trim.setPos(0.0, side * (self.sim_config.width * 0.425), 0.008)
+                trim.setPos(0.0, side * (self.sim_config.width * 0.418), 0.006)
 
     def _build_rails(self) -> None:
         for index, (rail_np, _, segment, lateral_offset) in enumerate(self.simulation.rail_nodes):
@@ -849,23 +842,34 @@ class MarbleRampApp(ShowBase):
             marker.setPos(0.0, lateral, 0.10)
             self._register_pulse(marker, amplitude=0.22, speed=2.0, phase=index * 0.3)
 
-        pad = gate.attachNewNode("finish-pad")
+        finish_pad = gate.attachNewNode("finish-pad")
         self._attach_centered_box(
-            pad,
-            size=Vec3(0.60, self.sim_config.width * 0.96, 0.016),
-            color=Vec4(0.24, 0.70, 0.92, 1.0),
-            style="screen",
+            finish_pad,
+            size=Vec3(0.92, self.sim_config.width * 0.98, 0.018),
+            color=Vec4(0.14, 0.16, 0.18, 1.0),
+            style="panel",
         )
-        pad.setPos(0.02, 0.0, 0.02)
+        finish_pad.setPos(0.02, 0.0, 0.02)
 
-        for index, lateral in enumerate((-0.78, -0.52, -0.26, 0.0, 0.26, 0.52, 0.78)):
-            tile = gate.attachNewNode(f"finish-tile-{index}")
-            self._attach_centered_box(
-                tile,
-                size=Vec3(0.16, 0.16, 0.008),
-                color=Vec4(0.96, 0.96, 0.98, 1.0) if index % 2 == 0 else Vec4(0.16, 0.18, 0.22, 1.0),
-            )
-            tile.setPos(0.08, lateral, 0.03)
+        tile_length = 0.12
+        row_offsets = (-0.07, 0.07)
+        lateral_min = -self.sim_config.width * 0.42
+        lateral_step = 0.24
+        lateral_values: list[float] = []
+        lateral = lateral_min
+        while lateral <= self.sim_config.width * 0.42 + 1e-6:
+            lateral_values.append(lateral)
+            lateral += lateral_step
+        for row_index, row_offset in enumerate(row_offsets):
+            for column_index, lateral in enumerate(lateral_values):
+                tile = gate.attachNewNode(f"finish-tile-{row_index}-{column_index}")
+                self._attach_centered_box(
+                    tile,
+                    size=Vec3(tile_length, 0.20, 0.010),
+                    color=Vec4(0.96, 0.96, 0.98, 1.0) if (row_index + column_index) % 2 == 0 else Vec4(0.10, 0.12, 0.14, 1.0),
+                    depth_offset=1,
+                )
+                tile.setPos(row_offset, lateral, 0.034)
 
     def _build_obstacles(self) -> None:
         colors = {
@@ -893,16 +897,24 @@ class MarbleRampApp(ShowBase):
         marker.setPos(
             ramp_surface_point(self.sim_config, marker_distance)
             + ramp_side(self.sim_config, marker_distance) * obstacle.lateral_offset
-            + ramp_normal(self.sim_config, marker_distance) * 0.02
+            + ramp_normal(self.sim_config, marker_distance) * 0.055
         )
         marker.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
 
         plate_width = min(self.sim_config.width * 0.78, obstacle.width + 0.42)
         self._attach_centered_box(
             marker,
+            size=Vec3(0.60, plate_width + 0.08, 0.024),
+            color=Vec4(0.08, 0.10, 0.13, 1.0),
+            style="panel",
+            depth_offset=1,
+        )
+        self._attach_centered_box(
+            marker,
             size=Vec3(0.52, plate_width, 0.012),
             color=Vec4(color.x * 0.95, color.y * 0.95, color.z * 0.95, 1.0),
             style="screen",
+            depth_offset=2,
         )
 
         center_line = marker.attachNewNode("center-line")
@@ -911,8 +923,9 @@ class MarbleRampApp(ShowBase):
             size=Vec3(0.36, min(plate_width * 0.34, 0.14), 0.014),
             color=Vec4(0.95, 0.96, 0.98, 1.0),
             style="screen",
+            depth_offset=3,
         )
-        center_line.setZ(0.01)
+        center_line.setZ(0.018)
 
     def _attach_obstacle_visual(self, parent: NodePath, obstacle: GuideObstacle, color: Vec4) -> None:
         size = Vec3(obstacle.length, obstacle.width, obstacle.height)
@@ -1598,6 +1611,7 @@ class MarbleRampApp(ShowBase):
             )
         if self.countdown_timer <= 0.0:
             self.race_phase = "running"
+            self.simulation.add_forward_speed(1.35)
             self._show_event("GO!", "", Vec4(0.92, 0.94, 0.98, 1.0), hold=0.9)
 
     def _activate_boost_pad(self, pad: BoostPadVisual, index: int) -> None:
@@ -1608,7 +1622,8 @@ class MarbleRampApp(ShowBase):
         self.section_boost_hits += 1
         self.boost_chain += 1
         self.best_boost_chain = max(self.best_boost_chain, self.boost_chain)
-        self.boost_flash = max(self.boost_flash, 0.35)
+        self.boost_flash = max(self.boost_flash, 0.60)
+        self._trigger_flash(Vec4(0.26, 0.84, 0.98, 1.0), 0.10)
 
     def _complete_section(self, section_index: int) -> None:
         section = self.course_sections[section_index]
@@ -1685,14 +1700,13 @@ class MarbleRampApp(ShowBase):
         self.finish_flash = 0.25
 
     def _should_reset_for_off_track(self, previous_state, state, dt: float) -> bool:
-        catastrophic_off_track = state.position.z < -10.0
-
-        if catastrophic_off_track:
-            self.off_track_timer += dt
-        else:
-            self.off_track_timer = max(0.0, self.off_track_timer - dt * 3.0)
-
-        return self.off_track_timer >= self.off_track_grace
+        del dt
+        reference_distance = max(previous_state.path_distance, state.path_distance)
+        return is_position_off_track(
+            self.sim_config,
+            state.position,
+            reference_distance=reference_distance,
+        )
 
     def _handle_running_state(self, previous_state, state, dt: float) -> None:
         if state.boost_active and not previous_state.boost_active:
@@ -1776,15 +1790,22 @@ class MarbleRampApp(ShowBase):
             line.setColor(0.78, 0.82, 0.88, alpha)
 
         for pad in self.boost_pads:
-            pulse_scale = 1.0 + pad.pulse * 0.04
-            ambient_scale = 0.94
+            pulse_scale = 1.0 + pad.pulse * 0.10
+            ambient_scale = 0.92
             if pad.spent:
-                ambient_scale *= 0.82
+                ambient_scale *= 0.78
             pad.root.setScale(pulse_scale)
             pad.root.setColorScale(
-                ambient_scale + pad.pulse * 0.08,
-                ambient_scale + pad.pulse * 0.08,
-                ambient_scale + pad.pulse * 0.10,
+                ambient_scale + pad.pulse * 0.16,
+                ambient_scale + pad.pulse * 0.24,
+                ambient_scale + pad.pulse * 0.30,
+                1.0,
+            )
+            pad.glow.setScale(1.0 + pad.pulse * 0.18)
+            pad.glow.setColorScale(
+                0.78 + pad.pulse * 0.28,
+                0.88 + pad.pulse * 0.36,
+                0.96 + pad.pulse * 0.42,
                 1.0,
             )
 
@@ -1897,6 +1918,7 @@ class MarbleRampApp(ShowBase):
         size: Vec3,
         color: Vec4,
         style: str | None = None,
+        depth_offset: int = 0,
     ) -> None:
         box = self.loader.loadModel("models/box")
         box.reparentTo(parent)
@@ -1907,6 +1929,7 @@ class MarbleRampApp(ShowBase):
         else:
             box.setTexture(self._get_texture(style), 1)
         box.setColor(color)
+        self._apply_render_finish(box, style, depth_offset=depth_offset)
 
     def _load_styled_model(
         self,
@@ -1917,6 +1940,7 @@ class MarbleRampApp(ShowBase):
         color: Vec4,
         pos: Vec3 | None = None,
         style: str | None = None,
+        depth_offset: int = 0,
     ) -> NodePath:
         model_path = resolve_model_path(model_name)
         if model_path is None:
@@ -1935,7 +1959,17 @@ class MarbleRampApp(ShowBase):
         else:
             model.setTexture(self._get_texture(style), 1)
         model.setColor(color)
+        self._apply_render_finish(model, style, depth_offset=depth_offset)
         return model
+
+    def _apply_render_finish(self, node: NodePath, style: str | None, *, depth_offset: int = 0) -> None:
+        node.clearColorScale()
+        node.setShaderOff(1)
+        node.setAntialias(AntialiasAttrib.MAuto)
+        if style == "screen":
+            node.setDepthOffset(max(1, depth_offset))
+        elif depth_offset != 0:
+            node.setDepthOffset(depth_offset)
 
     def _get_texture(self, style: str) -> Texture:
         cached = self._texture_cache.get(style)
@@ -1971,34 +2005,36 @@ class MarbleRampApp(ShowBase):
                         v += 0.22
                     if y % 40 < 2:
                         v += 0.10
-                    image.set_xel_a(x, y, v * 0.6, v * 0.75, v, 1.0)
+                    image.set_xel_a(x, y, v * 0.74, v * 0.78, v * 0.82, 1.0)
         elif style == "track":
             for y in range(256):
                 for x in range(256):
-                    pattern = 0.02 if (x + y) % 24 < 2 or (x - y) % 28 < 2 else 0.0
-                    seam = 0.08 if y % 64 < 2 else 0.0
-                    v = 0.12 + pattern + seam
-                    image.set_xel_a(x, y, v * 0.95, v, v * 1.1, 1.0)
+                    pattern = 0.010 if (x + y) % 36 < 2 or (x - y) % 44 < 2 else 0.0
+                    seam = 0.035 if y % 96 < 2 else 0.0
+                    grain = (((x * 11) + (y * 7)) % 23) / 900.0
+                    v = 0.12 + pattern + seam + grain
+                    image.set_xel_a(x, y, v * 0.94, v * 0.96, v * 0.98, 1.0)
         elif style == "screen":
             for y in range(256):
                 t = y / 255.0
                 for x in range(256):
-                    pulse = 0.18 if x % 32 < 4 else 0.0
+                    stripe = 0.035 if x % 56 < 3 else 0.0
+                    grid = 0.018 if y % 44 < 2 else 0.0
                     image.set_xel_a(
                         x,
                         y,
-                        0.22 + 0.18 * (1.0 - t) + pulse,
-                        0.42 + 0.22 * (1.0 - t) + pulse * 0.6,
-                        0.58 + 0.24 * (1.0 - t),
+                        0.20 + 0.10 * (1.0 - t) + stripe,
+                        0.34 + 0.14 * (1.0 - t) + stripe * 0.55 + grid,
+                        0.40 + 0.16 * (1.0 - t) + stripe * 0.40 + grid * 0.8,
                         1.0,
                     )
         else:
             for y in range(256):
                 for x in range(256):
-                    seam = 0.10 if x % 64 < 2 or y % 64 < 2 else 0.0
-                    grain = (((x * 13) + (y * 7)) % 19) / 255.0
+                    seam = 0.04 if x % 88 < 2 or y % 88 < 2 else 0.0
+                    grain = (((x * 13) + (y * 7)) % 19) / 420.0
                     v = 0.10 + seam + grain
-                    image.set_xel_a(x, y, v * 0.9, v * 0.95, v, 1.0)
+                    image.set_xel_a(x, y, v * 0.92, v * 0.95, v * 0.98, 1.0)
 
         texture = Texture(style)
         texture.load(image)

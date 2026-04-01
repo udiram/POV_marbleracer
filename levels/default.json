@@ -1,19 +1,19 @@
 {
   "name": "Default Showcase",
-  "description": "Long banked course. Sparse obstacles. Fast lines.",
+  "description": "Longer banked course with a late technical sweep and a faster final setup.",
   "metadata": {
     "difficulty": "moderate",
     "theme": "showcase",
     "unlock_index": 0,
     "target_times": {
-      "gold": 25.5,
-      "silver": 28.0,
-      "bronze": 31.0
+      "gold": 29.5,
+      "silver": 32.5,
+      "bronze": 36.0
     }
   },
   "track": {
     "angle_deg": 16.51543534129152,
-    "length": 107.90187031545979,
+    "length": 123.90187031545979,
     "height": 39.5,
     "width": 2.32,
     "segment_headings_deg": [
@@ -209,7 +209,23 @@
       2.701405903143666,
       2.3007192020890916,
       1.74993572775048,
-      1.4095193978434508
+      1.4095193978434508,
+      0.9,
+      -0.2,
+      -1.8,
+      -3.9,
+      -6.2,
+      -8.4,
+      -10.1,
+      -11.3,
+      -11.8,
+      -10.6,
+      -8.1,
+      -4.7,
+      -0.8,
+      2.9,
+      6.1,
+      8.4
     ],
     "segment_bank_deg": [
       0.0,
@@ -397,13 +413,29 @@
       0.0,
       0.0,
       0.0,
+      0.4,
+      0.8,
+      1.2,
+      2.0,
+      3.2,
+      4.6,
+      5.8,
+      6.2,
+      5.1,
+      3.8,
+      2.1,
+      0.4,
+      -1.3,
+      -2.4,
+      -2.8,
+      -2.0,
+      -0.8,
       0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
-      0.0,
+      0.6,
+      1.0,
+      1.4,
+      1.0,
+      0.5,
       0.0
     ]
   },
@@ -430,14 +462,14 @@
       "acceleration": 6.6
     },
     {
-      "distance_along_ramp": 83.16,
+      "distance_along_ramp": 89.4,
       "lateral_offset": 0.0,
       "length": 1.94,
       "width": 1.52,
       "acceleration": 7.0
     },
     {
-      "distance_along_ramp": 98.28,
+      "distance_along_ramp": 113.4,
       "lateral_offset": 0.0,
       "length": 2.0,
       "width": 1.52,
@@ -509,7 +541,7 @@
       "kind": "block"
     },
     {
-      "distance_along_ramp": 88.56,
+      "distance_along_ramp": 95.4,
       "lateral_offset": -0.28,
       "length": 0.82,
       "width": 0.28,
@@ -518,8 +550,8 @@
       "kind": "block"
     },
     {
-      "distance_along_ramp": 93.96,
-      "lateral_offset": 0.28,
+      "distance_along_ramp": 103.2,
+      "lateral_offset": 0.34,
       "length": 0.82,
       "width": 0.28,
       "height": 0.24,
@@ -527,8 +559,8 @@
       "kind": "block"
     },
     {
-      "distance_along_ramp": 101.52,
-      "lateral_offset": 0.0,
+      "distance_along_ramp": 119.1,
+      "lateral_offset": -0.08,
       "length": 0.92,
       "width": 0.28,
       "height": 0.24,
