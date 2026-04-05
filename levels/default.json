@@ -441,44 +441,30 @@
   },
   "boost_pads": [
     {
-      "distance_along_ramp": 12.96,
+      "distance_along_ramp": 11.0,
       "lateral_offset": 0.0,
-      "length": 1.6,
-      "width": 1.52,
-      "acceleration": 5.7
+      "length": 1.46,
+      "width": 1.18,
+      "acceleration": 6.4
     },
     {
-      "distance_along_ramp": 35.64,
-      "lateral_offset": 0.0,
-      "length": 1.74,
-      "width": 1.52,
-      "acceleration": 6.1
-    },
-    {
-      "distance_along_ramp": 59.4,
-      "lateral_offset": 0.0,
-      "length": 1.86,
-      "width": 1.52,
-      "acceleration": 6.6
-    },
-    {
-      "distance_along_ramp": 89.4,
+      "distance_along_ramp": 95.0,
       "lateral_offset": 0.0,
       "length": 1.94,
       "width": 1.52,
       "acceleration": 7.0
     },
     {
-      "distance_along_ramp": 113.4,
+      "distance_along_ramp": 114.2,
       "lateral_offset": 0.0,
       "length": 2.0,
-      "width": 1.52,
-      "acceleration": 7.4
+      "width": 1.58,
+      "acceleration": 6.5
     }
   ],
   "obstacles": [
     {
-      "distance_along_ramp": 19.44,
+      "distance_along_ramp": 23.0,
       "lateral_offset": -0.34,
       "length": 0.96,
       "width": 0.3,
@@ -487,7 +473,7 @@
       "kind": "block"
     },
     {
-      "distance_along_ramp": 25.92,
+      "distance_along_ramp": 29.2,
       "lateral_offset": 0.32,
       "length": 0.92,
       "width": 0.3,
@@ -496,52 +482,66 @@
       "kind": "block"
     },
     {
-      "distance_along_ramp": 42.12,
-      "lateral_offset": -0.3,
-      "length": 0.84,
-      "width": 0.3,
+      "distance_along_ramp": 43.0,
+      "lateral_offset": -0.24,
+      "length": 0.92,
+      "width": 0.30,
       "height": 0.24,
-      "heading_deg": 4.0,
+      "heading_deg": 0.0,
       "kind": "block"
     },
     {
-      "distance_along_ramp": 49.68,
-      "lateral_offset": 0.34,
-      "length": 0.84,
-      "width": 0.3,
+      "distance_along_ramp": 57.5,
+      "lateral_offset": 0.26,
+      "length": 0.88,
+      "width": 0.30,
       "height": 0.24,
-      "heading_deg": -4.0,
+      "heading_deg": 0.0,
       "kind": "block"
     },
     {
-      "distance_along_ramp": 62.64,
+      "distance_along_ramp": 71.5,
+      "lateral_offset": -0.28,
+      "length": 0.34,
+      "width": 0.54,
+      "height": 0.34,
+      "heading_deg": 0.0,
+      "kind": "pendulum",
+      "motion_kind": "pendulum",
+      "motion_amplitude": 0.28,
+      "motion_speed": 2.10,
+      "motion_phase": 0.4,
+      "pivot_height": 1.18
+    },
+    {
+      "distance_along_ramp": 79.5,
+      "lateral_offset": 0.30,
+      "length": 0.34,
+      "width": 0.54,
+      "height": 0.34,
+      "heading_deg": 0.0,
+      "kind": "pendulum",
+      "motion_kind": "pendulum",
+      "motion_amplitude": 0.26,
+      "motion_speed": 1.85,
+      "motion_phase": 1.4,
+      "pivot_height": 1.12
+    },
+    {
+      "distance_along_ramp": 89.0,
       "lateral_offset": 0.0,
-      "length": 1.08,
-      "width": 0.3,
-      "height": 0.26,
-      "heading_deg": 8.0,
-      "kind": "block"
-    },
-    {
-      "distance_along_ramp": 71.28,
-      "lateral_offset": -0.3,
-      "length": 0.86,
-      "width": 0.3,
-      "height": 0.24,
+      "length": 1.42,
+      "width": 0.22,
+      "height": 0.28,
       "heading_deg": 0.0,
-      "kind": "block"
+      "kind": "sweeper",
+      "motion_kind": "sweeper",
+      "motion_amplitude": 0.66,
+      "motion_speed": 2.55,
+      "motion_phase": 1.0
     },
     {
-      "distance_along_ramp": 77.76,
-      "lateral_offset": 0.32,
-      "length": 0.86,
-      "width": 0.3,
-      "height": 0.24,
-      "heading_deg": 0.0,
-      "kind": "block"
-    },
-    {
-      "distance_along_ramp": 95.4,
+      "distance_along_ramp": 101.0,
       "lateral_offset": -0.28,
       "length": 0.82,
       "width": 0.28,
@@ -550,7 +550,7 @@
       "kind": "block"
     },
     {
-      "distance_along_ramp": 103.2,
+      "distance_along_ramp": 108.0,
       "lateral_offset": 0.34,
       "length": 0.82,
       "width": 0.28,
@@ -559,8 +559,8 @@
       "kind": "block"
     },
     {
-      "distance_along_ramp": 119.1,
-      "lateral_offset": -0.08,
+      "distance_along_ramp": 119.0,
+      "lateral_offset": 0.52,
       "length": 0.92,
       "width": 0.28,
       "height": 0.24,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from math import cos, exp, radians, sin, tan
+from math import cos, degrees, exp, radians, sin, tan
 from random import Random
 
 from panda3d.bullet import BulletBoxShape, BulletRigidBodyNode, BulletSphereShape, BulletWorld
@@ -46,6 +46,11 @@ class GuideObstacle:
     height: float
     heading_deg: float
     kind: str = "block"
+    motion_kind: str = "static"
+    motion_amplitude: float = 0.0
+    motion_speed: float = 0.0
+    motion_phase: float = 0.0
+    pivot_height: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +69,13 @@ class RampSegment:
     heading_deg: float
     bank_deg: float
     start_point: Vec3
+
+
+@dataclass(frozen=True, slots=True)
+class SplitSection:
+    start_distance: float
+    end_distance: float
+    gap_width: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +101,7 @@ class SimulationConfig:
     obstacle_count: int = 10
     course_seed: int = 7
     auto_boost_pads: bool = True
+    split_sections: tuple[SplitSection, ...] = field(default_factory=tuple)
     segment_headings_deg: tuple[float, ...] = (
         0.0,
         2.0,
@@ -169,6 +182,11 @@ class SimulationConfig:
             object.__setattr__(self, "segment_bank_deg", tuple(0.0 for _ in self.segment_headings_deg))
         if len(self.segment_bank_deg) != len(self.segment_headings_deg):
             raise ValueError("Segment bank angles must align with the ramp heading segments.")
+        for split in self.split_sections:
+            if not (0.0 <= split.start_distance < split.end_distance <= self.length):
+                raise ValueError("Split section must lie on the ramp.")
+            if split.gap_width <= 0.0 or split.gap_width >= self.width:
+                raise ValueError("Split section gap width must be positive and narrower than the track.")
         if self.auto_boost_pads and not self.boost_pads:
             object.__setattr__(self, "boost_pads", default_boost_pads(self))
         if not self.obstacles and self.obstacle_count > 0:
@@ -185,7 +203,7 @@ class SimulationConfig:
                 raise ValueError("Obstacle must lie on the ramp.")
             if obstacle.length <= 0.0 or obstacle.width <= 0.0 or obstacle.height <= 0.0:
                 raise ValueError("Obstacle dimensions must be positive.")
-            if abs(obstacle.lateral_offset) + obstacle.width * 0.5 >= self.width * 0.5:
+            if abs(obstacle.lateral_offset) + abs(obstacle.motion_amplitude) + obstacle.width * 0.5 >= self.width * 0.5:
                 raise ValueError("Obstacle extends off the ramp.")
         for boost_pad in self.boost_pads:
             if not (0.0 < boost_pad.distance_along_ramp < self.length):
@@ -365,6 +383,35 @@ def ramp_segment_at_distance(config: SimulationConfig, distance_along_ramp: floa
     return segments[segment_index]
 
 
+def split_gap_width(config: SimulationConfig, distance_along_ramp: float) -> float:
+    clamped_distance = max(0.0, min(config.length, distance_along_ramp))
+    for split in config.split_sections:
+        if split.start_distance <= clamped_distance <= split.end_distance:
+            return split.gap_width
+    return 0.0
+
+
+def lane_surface_width(config: SimulationConfig, distance_along_ramp: float) -> float:
+    gap_width = split_gap_width(config, distance_along_ramp)
+    if gap_width <= 0.0:
+        return config.width
+    return max(0.1, (config.width - gap_width) * 0.5)
+
+
+def lane_center_offsets(config: SimulationConfig, distance_along_ramp: float) -> tuple[float, ...]:
+    gap_width = split_gap_width(config, distance_along_ramp)
+    if gap_width <= 0.0:
+        return (0.0,)
+    lane_width = lane_surface_width(config, distance_along_ramp)
+    center_offset = gap_width * 0.5 + lane_width * 0.5
+    return (-center_offset, center_offset)
+
+
+def is_lateral_within_gap(config: SimulationConfig, distance_along_ramp: float, lateral_offset: float) -> bool:
+    gap_width = split_gap_width(config, distance_along_ramp)
+    return gap_width > 0.0 and abs(lateral_offset) < gap_width * 0.5
+
+
 def path_distance_for_position(config: SimulationConfig, position: Vec3) -> float:
     return _path_distance_for_position(config, position)
 
@@ -442,7 +489,10 @@ def is_position_off_track(
     surface_point = ramp_surface_point(config, path_distance)
     relative = position - surface_point
     lateral_offset = abs(relative.dot(ramp_side(config, path_distance)))
+    signed_lateral_offset = relative.dot(ramp_side(config, path_distance))
     normal_offset = relative.dot(ramp_normal(config, path_distance))
+    if is_lateral_within_gap(config, path_distance, signed_lateral_offset):
+        return True
     if lateral_offset > config.width * 0.5 + 0.22:
         return True
     if normal_offset < -0.28:
@@ -474,6 +524,32 @@ def obstacle_center_position(config: SimulationConfig, obstacle: GuideObstacle) 
         + ramp_side(config, obstacle.distance_along_ramp) * obstacle.lateral_offset
         + ramp_normal(config, obstacle.distance_along_ramp) * (obstacle.height * 0.5)
     )
+
+
+def obstacle_pose(config: SimulationConfig, obstacle: GuideObstacle, time_s: float) -> tuple[Vec3, float]:
+    distance = obstacle.distance_along_ramp
+    side = ramp_side(config, distance)
+    normal = ramp_normal(config, distance)
+    surface = ramp_surface_point(config, distance)
+    heading_deg = obstacle.heading_deg
+    lateral_offset = obstacle.lateral_offset
+    motion_angle = obstacle.motion_phase + time_s * obstacle.motion_speed
+
+    if obstacle.motion_kind == "sweeper":
+        lateral_offset += sin(motion_angle) * obstacle.motion_amplitude
+        heading_deg += cos(motion_angle) * 22.0
+        return surface + side * lateral_offset + normal * (obstacle.height * 0.5), heading_deg
+
+    if obstacle.motion_kind == "pendulum":
+        pivot_height = obstacle.pivot_height if obstacle.pivot_height > 0.0 else 1.05
+        rod_length = max(obstacle.height * 0.5 + 0.16, pivot_height - obstacle.height * 0.5)
+        swing_angle = sin(motion_angle) * obstacle.motion_amplitude
+        bob_lateral = lateral_offset + sin(swing_angle) * rod_length
+        bob_height = pivot_height - cos(swing_angle) * rod_length
+        heading_deg += degrees(swing_angle) * 0.12
+        return surface + side * bob_lateral + normal * bob_height, heading_deg
+
+    return surface + side * lateral_offset + normal * (obstacle.height * 0.5), heading_deg
 
 
 def boost_pad_center_position(config: SimulationConfig, boost_pad: BoostPad) -> Vec3:
@@ -519,7 +595,9 @@ def section_distance_ranges(config: SimulationConfig) -> tuple[tuple[SectionBlue
 def default_boost_pads(config: SimulationConfig) -> tuple[BoostPad, ...]:
     boost_width = min(config.width - 0.26, 1.52)
     return (
-        BoostPad(config.length * 0.12, 0.0, 1.60, boost_width, 5.7),
+        BoostPad(config.length * 0.05, -0.26, 1.10, boost_width * 0.62, 5.8),
+        BoostPad(config.length * 0.09, 0.26, 1.18, boost_width * 0.62, 6.2),
+        BoostPad(config.length * 0.14, 0.0, 1.40, boost_width * 0.82, 6.4),
         BoostPad(config.length * 0.33, 0.0, 1.74, boost_width, 6.1),
         BoostPad(config.length * 0.55, 0.0, 1.86, boost_width, 6.6),
         BoostPad(config.length * 0.77, 0.0, 1.94, boost_width, 7.0),
@@ -1067,44 +1145,45 @@ class MarbleRampSimulation:
         self._cached_path_distance = path_distance_for_position(self.config, self.marble_np.getPos())
         self._refresh_motion_signals(1.0 / 120.0, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
 
-    def _create_ground(self) -> tuple[NodePath, BulletRigidBodyNode]:
-        body = BulletRigidBodyNode("ground")
-        body.addShape(BulletBoxShape(Vec3(self.config.length + 12.0, 12.0, 0.25)))
-        body.setFriction(self.config.ramp_friction)
-        body.setRestitution(self.config.restitution)
-        node_path = self.root.attachNewNode(body)
-        node_path.setPos(self.config.length * 0.55, 0.0, -0.25)
-        self.world.attachRigidBody(body)
-        return node_path, body
+    def _create_ground(self) -> tuple[NodePath, BulletRigidBodyNode | None]:
+        return self.root.attachNewNode("ground-placeholder"), None
 
     def _create_ramp(self) -> list[tuple[NodePath, BulletRigidBodyNode, RampSegment]]:
         ramp_nodes: list[tuple[NodePath, BulletRigidBodyNode, RampSegment]] = []
         for index, segment in enumerate(self.ramp_segments):
-            body = BulletRigidBodyNode(f"ramp-{index}")
-            body.addShape(
-                BulletBoxShape(
-                    Vec3(
-                        segment.length * 0.525,
-                        self.config.width * 0.54,
-                        self.config.ramp_thickness * 0.5,
+            center_distance = segment.start_distance + segment.length * 0.5
+            for lane_index, lateral_offset in enumerate(lane_center_offsets(self.config, center_distance)):
+                body = BulletRigidBodyNode(f"ramp-{index}-{lane_index}")
+                lane_width = lane_surface_width(self.config, center_distance)
+                body.addShape(
+                    BulletBoxShape(
+                        Vec3(
+                            segment.length * 0.525,
+                            lane_width * 0.54,
+                            self.config.ramp_thickness * 0.5,
+                        )
                     )
                 )
-            )
-            body.setFriction(self.config.ramp_friction)
-            body.setRestitution(self.config.restitution)
-            node_path = self.root.attachNewNode(body)
-            node_path.setPos(ramp_center_position(self.config, segment))
-            node_path.setHpr(segment.heading_deg, segment.bank_deg, self.config.angle_deg)
-            self.world.attachRigidBody(body)
-            ramp_nodes.append((node_path, body, segment))
+                body.setFriction(self.config.ramp_friction)
+                body.setRestitution(self.config.restitution)
+                node_path = self.root.attachNewNode(body)
+                node_path.setPos(ramp_center_position(self.config, segment) + ramp_side(self.config, center_distance) * lateral_offset)
+                node_path.setHpr(segment.heading_deg, segment.bank_deg, self.config.angle_deg)
+                self.world.attachRigidBody(body)
+                ramp_nodes.append((node_path, body, segment))
         return ramp_nodes
 
     def _create_rails(self) -> list[tuple[NodePath, BulletRigidBodyNode, RampSegment, float]]:
-        rails: list[tuple[NodePath, BulletRigidBodyNode]] = []
-        lateral = self.config.width * 0.5 - self.config.rail_width * 0.5
         rails: list[tuple[NodePath, BulletRigidBodyNode, RampSegment, float]] = []
         for segment in self.ramp_segments:
-            for side, offset in enumerate((-lateral, lateral)):
+            center_distance = segment.start_distance + segment.length * 0.5
+            outer_lateral = self.config.width * 0.5 - self.config.rail_width * 0.5
+            offsets = [-outer_lateral, outer_lateral]
+            gap_width = split_gap_width(self.config, center_distance)
+            if gap_width > 0.0:
+                inner_lateral = gap_width * 0.5 + self.config.rail_width * 0.5
+                offsets.extend((-inner_lateral, inner_lateral))
+            for side, offset in enumerate(offsets):
                 body = BulletRigidBodyNode(f"rail-{int(segment.start_distance)}-{side}")
                 body.addShape(
                     BulletBoxShape(
@@ -1134,9 +1213,12 @@ class MarbleRampSimulation:
             body.setFriction(self.config.obstacle_friction)
             body.setRestitution(self.config.restitution)
             node_path = self.root.attachNewNode(body)
-            node_path.setPos(obstacle_center_position(self.config, obstacle))
+            center, heading_deg = obstacle_pose(self.config, obstacle, 0.0)
+            node_path.setPos(center)
             segment = ramp_segment_at_distance(self.config, obstacle.distance_along_ramp)
-            node_path.setHpr(segment.heading_deg + obstacle.heading_deg, segment.bank_deg, self.config.angle_deg)
+            node_path.setHpr(segment.heading_deg + heading_deg, segment.bank_deg, self.config.angle_deg)
+            if obstacle.motion_kind != "static":
+                body.setKinematic(True)
             self.world.attachRigidBody(body)
             obstacle_nodes.append((node_path, body, obstacle))
         return obstacle_nodes
@@ -1147,8 +1229,8 @@ class MarbleRampSimulation:
         body.setMass(self.config.marble_mass)
         body.setFriction(self.config.marble_friction)
         body.setRestitution(self.config.restitution)
-        body.setLinearDamping(0.015)
-        body.setAngularDamping(0.015)
+        body.setLinearDamping(0.008)
+        body.setAngularDamping(0.010)
         body.setCcdMotionThreshold(1e-7)
         body.setCcdSweptSphereRadius(self.config.marble_radius * 0.98)
 
@@ -1165,7 +1247,14 @@ class MarbleRampSimulation:
         self.steering_input = 0.0
         self.brake_input = 0.0
         self.active_boost_pad_index = None
-        start_pos = ramp_surface_point(self.config, 0.0) + ramp_normal(self.config) * (
+        self.respawn_marble(distance=0.0)
+        self._update_moving_obstacles(0.0)
+        self._cached_path_distance = path_distance_for_position(self.config, self.marble_np.getPos())
+        self._refresh_motion_signals(1.0 / 120.0, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
+
+    def respawn_marble(self, *, distance: float = 0.0) -> None:
+        spawn_distance = max(0.0, min(self.config.length - 1.0, distance))
+        start_pos = ramp_surface_point(self.config, spawn_distance) + ramp_normal(self.config, spawn_distance) * (
             self.config.marble_radius + MARBLE_START_SURFACE_CLEARANCE
         )
         self.marble_np.setPos(start_pos)
@@ -1173,13 +1262,13 @@ class MarbleRampSimulation:
         self.marble_body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
         self.marble_body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
         self.marble_body.clearForces()
-        self._cached_path_distance = path_distance_for_position(self.config, self.marble_np.getPos())
-        self._refresh_motion_signals(1.0 / 120.0, Vec3(0.0, 0.0, 0.0), Vec3(0.0, 0.0, 0.0))
+        self._cached_path_distance = spawn_distance
 
     def settle_start_contact(self, *, settle_steps: int = 48, dt: float = 1.0 / 960.0) -> None:
         if settle_steps <= 0 or dt <= 0.0:
             return
         for _ in range(settle_steps):
+            self._update_moving_obstacles(self.time)
             self.world.doPhysics(dt, 1, dt)
         self.marble_body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
         self.marble_body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
@@ -1206,6 +1295,7 @@ class MarbleRampSimulation:
         dt = max(0.0, dt)
         if dt > 0.0:
             self._apply_steering_force()
+            self._update_moving_obstacles(self.time + dt)
             velocity_before_step = Vec3(self.marble_body.getLinearVelocity())
             self.world.doPhysics(dt, 16, 1.0 / 960.0)
             velocity_after_physics = Vec3(self.marble_body.getLinearVelocity())
@@ -1214,6 +1304,15 @@ class MarbleRampSimulation:
             self._apply_boost_pad(dt)
             self.time += dt
         return self.snapshot()
+
+    def _update_moving_obstacles(self, time_s: float) -> None:
+        for obstacle_np, _, obstacle in self.obstacle_nodes:
+            if obstacle.motion_kind == "static":
+                continue
+            center, heading_deg = obstacle_pose(self.config, obstacle, time_s)
+            segment = ramp_segment_at_distance(self.config, obstacle.distance_along_ramp)
+            obstacle_np.setPos(center)
+            obstacle_np.setHpr(segment.heading_deg + heading_deg, segment.bank_deg, self.config.angle_deg)
 
     def _apply_steering_force(self) -> None:
         if abs(self.steering_input) <= 1e-6 or self.config.steering_acceleration <= 0.0:

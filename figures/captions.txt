@@ -1,0 +1,16 @@
+track_overview.pdf: Overall course geometry with plan, elevation, and banking profile.
+course_features.pdf: Placement of authored boost pads and obstacles on the default track.
+physics_summary.pdf: Key SimulationConfig values and the pure-rolling friction threshold check.
+rollout_telemetry.pdf: Headless baseline rollout showing distance, speed, lateral motion, and impact severity.
+asset_sheet.pdf: Offscreen renders of the main report assets using the actual Panda3D scene geometry.
+asset_track.png: Full in-engine render of the authored track.
+asset_marble.png: Player marble render.
+asset_ghost_marble.png: Ghost replay marble render.
+asset_bot_marble.png: Bot marble render.
+asset_boost_pad.png: Boost pad render on a short ramp slice.
+asset_rail.png: Rail render on a short ramp slice.
+asset_block_obstacle.png: Static block obstacle render.
+asset_pendulum_obstacle.png: Pendulum obstacle render.
+asset_sweeper_obstacle.png: Sweeper obstacle render.
+asset_start_pad.png: Start pad render.
+asset_finish_gate.png: Finish gate render.

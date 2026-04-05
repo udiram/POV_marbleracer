@@ -6,10 +6,9 @@ src/marbleracer/builder.py
 src/marbleracer/gameplay.py
 src/marbleracer/levels.py
 src/marbleracer/main.py
-src/marbleracer/optimization.py
 src/marbleracer/physics.py
 src/marbleracer/progress.py
-src/marbleracer/training_viz.py
+src/marbleracer/race_rules.py
 src/pov_marbleracer.egg-info/PKG-INFO
 src/pov_marbleracer.egg-info/SOURCES.txt
 src/pov_marbleracer.egg-info/dependency_links.txt
@@ -19,7 +18,5 @@ src/pov_marbleracer.egg-info/top_level.txt
 tests/test_camera.py
 tests/test_gameplay.py
 tests/test_levels.py
-tests/test_optimization.py
 tests/test_physics.py
 tests/test_progress.py
-tests/test_training_viz.py

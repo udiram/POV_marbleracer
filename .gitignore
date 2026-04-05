@@ -1,0 +1,9 @@
+.DS_Store
+.pytest_cache/
+.marbleracer_progress.json
+artifacts/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/

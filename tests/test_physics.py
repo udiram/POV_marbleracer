@@ -110,7 +110,7 @@ def test_default_course_exits_ramp_without_stalling() -> None:
     assert result.exited_ramp
     assert not result.stalled
     assert sum(result.obstacle_hits) >= 5
-    assert result.boost_activations >= 4
+    assert result.boost_activations >= 2
     assert result.max_impact_severity < 0.9
     assert result.airborne_fraction < 0.25
     assert result.max_abs_lateral > 0.20
@@ -141,8 +141,9 @@ def test_default_course_is_long_simple_and_fixed() -> None:
     assert len(config.segment_headings_deg) >= 24
     assert len(config.segment_bank_deg) == len(config.segment_headings_deg)
     assert len(config.obstacles) == 10
-    assert {obstacle.kind for obstacle in config.obstacles} == {"block"}
-    assert len(config.boost_pads) == 5
+    assert {obstacle.kind for obstacle in config.obstacles} == {"block", "pendulum", "sweeper"}
+    assert len(config.boost_pads) == 3
+    assert len(config.split_sections) == 0
 
 
 def test_off_track_detection_flags_fallthrough_and_side_exit() -> None:

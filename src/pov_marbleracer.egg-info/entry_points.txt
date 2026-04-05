@@ -1,5 +1,3 @@
 [console_scripts]
 marbleracer = marbleracer.main:main
 marbleracer-builder = marbleracer.builder:main
-marbleracer-train = marbleracer.optimization:main
-marbleracer-train-viz = marbleracer.training_viz:main

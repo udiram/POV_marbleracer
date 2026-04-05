@@ -10,7 +10,7 @@ from marbleracer.levels import (
     load_level,
     save_level,
 )
-from marbleracer.physics import BoostPad, GuideObstacle, SimulationConfig
+from marbleracer.physics import BoostPad, GuideObstacle, SimulationConfig, SplitSection
 
 
 def test_default_level_can_be_loaded_by_name() -> None:
@@ -19,8 +19,9 @@ def test_default_level_can_be_loaded_by_name() -> None:
 
     assert level.name == "Default Showcase"
     assert config.length == level.track["length"]
-    assert len(config.boost_pads) == 5
+    assert len(config.boost_pads) == 3
     assert len(config.obstacles) == 10
+    assert len(config.split_sections) == 0
     assert level.target_times is not None
     assert level.unlock_index == 0
     assert "default" in list_level_names()
@@ -35,6 +36,7 @@ def test_level_round_trip_preserves_track_boosts_and_obstacles(tmp_path) -> None
             "length": 64.0,
             "height": 25.0,
             "width": 2.4,
+            "split_sections": (SplitSection(20.0, 28.0, 0.6),),
             "segment_headings_deg": (0.0, 6.0, -3.0, 4.0),
             "segment_bank_deg": (0.0, 2.0, -2.0, 1.0),
         },
@@ -60,6 +62,7 @@ def test_level_round_trip_preserves_track_boosts_and_obstacles(tmp_path) -> None
     assert reloaded.description == level.description
     assert config.length == 64.0
     assert config.width == 2.4
+    assert config.split_sections == (SplitSection(20.0, 28.0, 0.6),)
     assert config.segment_headings_deg == (0.0, 6.0, -3.0, 4.0)
     assert len(config.boost_pads) == 2
     assert len(config.obstacles) == 2

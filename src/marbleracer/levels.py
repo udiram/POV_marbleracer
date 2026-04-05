@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .physics import BoostPad, GuideObstacle, SimulationConfig
+from .physics import BoostPad, GuideObstacle, SimulationConfig, SplitSection
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LEVELS_DIR = PROJECT_ROOT / "levels"
@@ -101,6 +101,11 @@ def _coerce_obstacles(items: object) -> tuple[GuideObstacle, ...]:
                 height=float(item["height"]),
                 heading_deg=float(item.get("heading_deg", 0.0)),
                 kind=str(item.get("kind", "block")),
+                motion_kind=str(item.get("motion_kind", "static")),
+                motion_amplitude=float(item.get("motion_amplitude", 0.0)),
+                motion_speed=float(item.get("motion_speed", 0.0)),
+                motion_phase=float(item.get("motion_phase", 0.0)),
+                pivot_height=float(item.get("pivot_height", 0.0)),
             )
             for item in items
         )
@@ -126,6 +131,24 @@ def _coerce_target_times(payload: object) -> LevelTargetTimes | None:
     return target_times
 
 
+def _coerce_split_sections(items: object) -> tuple[SplitSection, ...]:
+    if items is None:
+        return ()
+    if not isinstance(items, list):
+        raise ValueError("track.split_sections must be a list.")
+    try:
+        return tuple(
+            SplitSection(
+                start_distance=float(item["start_distance"]),
+                end_distance=float(item["end_distance"]),
+                gap_width=float(item["gap_width"]),
+            )
+            for item in items
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid split section entry in level file.") from exc
+
+
 def load_level(level_ref: str | Path) -> TrackLevel:
     path = resolve_level_path(level_ref)
     payload = json.loads(path.read_text())
@@ -136,6 +159,7 @@ def load_level(level_ref: str | Path) -> TrackLevel:
         raise ValueError("Level file is missing a track object.")
     headings = _coerce_float_tuple(track.get("segment_headings_deg"), "track.segment_headings_deg")
     banks = _coerce_float_tuple(track.get("segment_bank_deg"), "track.segment_bank_deg")
+    split_sections = _coerce_split_sections(track.get("split_sections"))
     metadata = payload.get("metadata")
     if metadata is None:
         metadata = {}
@@ -151,6 +175,7 @@ def load_level(level_ref: str | Path) -> TrackLevel:
             "width": float(track.get("width", SimulationConfig.width)),
             "segment_headings_deg": headings,
             "segment_bank_deg": banks,
+            "split_sections": split_sections,
         },
         boost_pads=_coerce_boost_pads(payload.get("boost_pads", [])),
         obstacles=_coerce_obstacles(payload.get("obstacles", [])),
@@ -171,6 +196,7 @@ def level_to_config(level: TrackLevel) -> SimulationConfig:
         width=float(track["width"]),
         segment_headings_deg=tuple(float(value) for value in track["segment_headings_deg"]),
         segment_bank_deg=tuple(float(value) for value in track["segment_bank_deg"]),
+        split_sections=tuple(track.get("split_sections", ())),
         boost_pads=level.boost_pads,
         obstacles=level.obstacles,
         auto_boost_pads=False,
@@ -200,6 +226,7 @@ def save_level(level: TrackLevel, destination: str | Path) -> Path:
             "width": float(level.track["width"]),
             "segment_headings_deg": [float(value) for value in level.track["segment_headings_deg"]],
             "segment_bank_deg": [float(value) for value in level.track["segment_bank_deg"]],
+            "split_sections": [asdict(split) for split in level.track.get("split_sections", ())],
         },
         "boost_pads": [asdict(boost_pad) for boost_pad in level.boost_pads],
         "obstacles": [asdict(obstacle) for obstacle in level.obstacles],
@@ -233,6 +260,7 @@ def level_from_config(
             "width": config.width,
             "segment_headings_deg": tuple(config.segment_headings_deg),
             "segment_bank_deg": tuple(config.segment_bank_deg),
+            "split_sections": tuple(config.split_sections),
         },
         boost_pads=tuple(config.boost_pads),
         obstacles=tuple(config.obstacles),

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from math import ceil, exp, sin
+from math import ceil, cos, degrees, exp, sin, tau
 from pathlib import Path
 
+from panda3d.bullet import BulletRigidBodyNode, BulletSphereShape
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
 from direct.task import Task
@@ -42,16 +43,30 @@ from .physics import (
     MarbleRampSimulation,
     SimulationConfig,
     boost_pad_center_position,
-    is_position_off_track,
+    lane_center_offsets,
+    lane_surface_width,
+    obstacle_pose,
     obstacle_center_position,
+    path_distance_for_position,
+    path_distance_for_position_near,
     ramp_normal,
     ramp_segment_at_distance,
     ramp_side,
     ramp_surface_point,
     ramp_tangent,
+    split_gap_width,
 )
 from .progress import GhostSample, load_progress, save_progress, update_level_progress
-
+from .race_rules import (
+    effective_track_distance as shared_effective_track_distance,
+    finish_grace_distance,
+    finish_line_distance as shared_finish_line_distance,
+    finish_metrics as shared_finish_metrics,
+    has_crossed_finish as shared_has_crossed_finish,
+    is_definitely_off_track as shared_is_definitely_off_track,
+    should_finish_run as shared_should_finish_run,
+    track_relative_offsets as shared_track_relative_offsets,
+)
 try:
     import simplepbr
 except ImportError:  # pragma: no cover - optional dependency
@@ -136,7 +151,6 @@ class BoostPadVisual:
     root: NodePath
     glow: NodePath
     phase: float
-    spent: bool = False
     pulse: float = 0.0
 
 
@@ -154,7 +168,48 @@ class GhostPlayback:
     marker: NodePath
 
 
+@dataclass(slots=True)
+class BotMarble:
+    name: str
+    body_np: NodePath
+    body: BulletRigidBodyNode
+    visual_root: NodePath
+    lane_offset: float
+    speed_bias: float
+    progress: float = 0.0
+    finish_time: float | None = None
+    finish_order: int | None = None
+    off_track_timer: float = 0.0
+    fall_timer: float = 0.0
+    reset_warning_second: int | None = None
+    previous_position: Vec3 | None = None
+    previous_progress: float = 0.0
+    active_boost_pad_index: int | None = None
+    last_boost_pad_index: int | None = None
+
+
+@dataclass(slots=True)
+class ConfettiPiece:
+    node: NodePath
+    velocity: Vec3
+    spin_hpr: Vec3
+    lifetime: float
+    age: float = 0.0
+
+
+@dataclass(slots=True)
+class MovingObstacleVisual:
+    obstacle: GuideObstacle
+    root: NodePath
+    marker: NodePath | None = None
+    arm: NodePath | None = None
+
+
 class MarbleRampApp(ShowBase):
+    MODE_TIME_TRIAL = "time_trial"
+    MODE_BOT_RACE = "bot_race"
+    MODE_OPTIONS = (MODE_TIME_TRIAL, MODE_BOT_RACE)
+
     def __init__(
         self,
         config: SimulationConfig | None = None,
@@ -162,6 +217,7 @@ class MarbleRampApp(ShowBase):
         levels: tuple[TrackLevel, ...] | None = None,
         initial_level: str | None = None,
         menu_disabled: bool = False,
+        start_mode: str | None = None,
     ) -> None:
         super().__init__()
         loaded_levels = tuple(levels or list_levels())
@@ -176,6 +232,10 @@ class MarbleRampApp(ShowBase):
             for level in loaded_levels
         )
         self.progress = load_progress()
+        self.selected_mode_index = 0
+        if start_mode in self.MODE_OPTIONS:
+            self.selected_mode_index = self.MODE_OPTIONS.index(start_mode)
+        self.active_mode = self.MODE_OPTIONS[self.selected_mode_index]
         self.selected_level_index = 0
         self.level_index = 0
         initial_level_index = self._find_level_index(initial_level)
@@ -189,24 +249,24 @@ class MarbleRampApp(ShowBase):
         self.menu_disabled = menu_disabled
         self.enable_fancy_rendering = os.environ.get("MARBLERACER_FANCY_RENDERING", "").strip() == "1"
         self.paused = False
-        self.camera_follow_distance = 7.4
-        self.camera_height = 5.2
-        self.camera_look_ahead = 3.2
+        self.camera_follow_distance = 6.6
+        self.camera_height = 4.8
+        self.camera_look_ahead = 3.8
         self.camera_side_offset = -0.25
         self.camera_target_drop = 0.45
         self.camera_track_follow_offset = 0.18
         self.camera_track_max_lag = 0.48
         self.camera_focus_lateral_lag = 1.6
         self.camera_focus_vertical_lag = 1.9
-        self.camera_position_lag = 4.8
-        self.camera_look_lag = 5.2
+        self.camera_position_lag = 5.6
+        self.camera_look_lag = 6.1
         self.camera_track_lag = 4.4
         self.camera_focus_lag = 3.8
         self.camera_heading_response = 2.0
         self.camera_velocity_heading_response = 2.8
         self.camera_collision_attack = 10.0
         self.camera_collision_release = 2.2
-        self.camera_roll_lag = 5.5
+        self.camera_roll_lag = 6.6
         self.camera_forward = ramp_tangent(self.sim_config, 0.0)
         self.camera_forward.z = 0.0
         self.camera_forward.normalize()
@@ -244,7 +304,13 @@ class MarbleRampApp(ShowBase):
         self.boost_chain = 0
         self.best_boost_chain = 0
         self.off_track_timer = 0.0
-        self.off_track_grace = 0.75
+        self.off_track_grace = 1.20
+        self.fall_reset_delay = 3.0
+        self.player_fall_timer = 0.0
+        self.player_reset_warning_second: int | None = None
+        self.start_input_lock_timer = 0.0
+        self.launch_assist_timer = 0.0
+        self.launch_assist_duration = 0.42
         self.last_supported_path_distance = 0.0
         self.impact_event_cooldown = 0.0
         self.next_section_index = 0
@@ -258,7 +324,13 @@ class MarbleRampApp(ShowBase):
         self.flash_color = Vec4(0.96, 0.42, 0.18, 0.0)
         self.boost_flash = 0.0
         self.finish_flash = 0.0
+        self.start_burst = 0.0
+        self.finish_order_counter = 0
+        self.last_finish_place: int | None = None
+        self.finish_confetti: list[ConfettiPiece] = []
         self.ghost_playback: GhostPlayback | None = None
+        self.bot_marbles: list[BotMarble] = []
+        self.moving_obstacle_visuals: list[MovingObstacleVisual] = []
         self.pending_ghost_samples: list[GhostSample] = []
         self._last_ghost_sample_time = 0.0
         self._stall_timer = 0.0
@@ -285,7 +357,7 @@ class MarbleRampApp(ShowBase):
 
     @property
     def finish_line_distance(self) -> float:
-        return max(0.0, self.sim_config.length - max(0.60, self.sim_config.marble_radius * 2.2))
+        return shared_finish_line_distance(self.sim_config)
 
     @property
     def current_level(self) -> TrackLevel:
@@ -294,6 +366,20 @@ class MarbleRampApp(ShowBase):
     @property
     def current_level_key(self) -> str:
         return self.level_runtime.key
+
+    def _mode_label(self, mode: str) -> str:
+        if mode == self.MODE_BOT_RACE:
+            return "BOT RACE"
+        return "TIME TRIAL"
+
+    def _mode_description(self, mode: str) -> str:
+        if mode == self.MODE_BOT_RACE:
+            return "Race a pack of physical bot marbles. Collisions count."
+        return "Race your saved ghost and chase the fastest clean lap."
+
+    @property
+    def selected_mode(self) -> str:
+        return self.MODE_OPTIONS[self.selected_mode_index]
 
     def _find_level_index(self, level_ref: str | None) -> int | None:
         if level_ref is None:
@@ -312,7 +398,10 @@ class MarbleRampApp(ShowBase):
     def _load_level_progress(self) -> None:
         progress_entry = self.progress.levels.get(self.current_level_key)
         self.session_best_time = progress_entry.best_time if progress_entry is not None else None
-        self._load_ghost(progress_entry.ghost if progress_entry is not None else ())
+        if self.active_mode == self.MODE_TIME_TRIAL and progress_entry is not None:
+            self._load_ghost(progress_entry.ghost)
+        else:
+            self._load_ghost(())
 
     def _load_runtime_level(self, index: int, *, reset_selection: bool = True) -> None:
         self.level_index = index
@@ -327,16 +416,20 @@ class MarbleRampApp(ShowBase):
         self.pulse_nodes = []
         self.speed_lines = []
         self.prop_spinners = []
+        self.moving_obstacle_visuals = []
+        self._clear_bot_marbles()
         if hasattr(self, "scene_root") and not self.scene_root.isEmpty():
             self.scene_root.removeNode()
         self._build_world()
         if hasattr(self, "finish_glow_np") and not self.finish_glow_np.isEmpty():
             finish_point = ramp_surface_point(self.sim_config, self.finish_line_distance)
             self.finish_glow_np.setPos(finish_point.x, finish_point.y, finish_point.z + 3.2)
+        self._spawn_bot_marbles()
         self._load_level_progress()
         self._reset()
 
     def _start_selected_level(self) -> None:
+        self.active_mode = self.selected_mode
         self._load_runtime_level(self.selected_level_index)
 
     def _unlock_next_level(self) -> None:
@@ -353,8 +446,8 @@ class MarbleRampApp(ShowBase):
         self.failure_reason = None
         self.selected_level_index = self.level_index
         self._show_event(
-            "TRACK SELECT",
-            "Up/Down choose   Enter start   R reset progress",
+            "MODE SELECT",
+            "Up/Down mode   Left/Right track   Enter start",
             Vec4(0.92, 0.94, 0.98, 1.0),
             hold=60.0,
         )
@@ -459,44 +552,12 @@ class MarbleRampApp(ShowBase):
         aura.setPos(self.sim_config.length - 1.2, 0.0, 0.08)
 
     def _build_ground(self) -> None:
-        plinth = self.scene_root.attachNewNode("plinth")
-        self._attach_centered_box(
-            plinth,
-            size=Vec3(self.sim_config.length + 11.0, 16.5, 0.9),
-            color=Vec4(0.08, 0.09, 0.11, 1.0),
-            style="panel",
-        )
-        plinth.setPos(self.sim_config.length * 0.5, 0.0, -0.46)
-
-        top = self.scene_root.attachNewNode("plinth-top")
-        self._attach_centered_box(
-            top,
-            size=Vec3(self.sim_config.length + 9.2, 14.2, 0.10),
-            color=Vec4(0.18, 0.19, 0.22, 1.0),
-            style="panel",
-        )
-        top.setPos(self.sim_config.length * 0.5, 0.0, 0.02)
-
-        runway = self.scene_root.attachNewNode("runway")
-        self._attach_centered_box(
-            runway,
-            size=Vec3(self.sim_config.length + 6.8, 4.9, 0.04),
-            color=Vec4(0.10, 0.13, 0.18, 1.0),
-            style="runway",
-        )
-        runway.setPos(self.sim_config.length * 0.5, 0.0, 0.08)
-
-        for lane_index in range(6):
-            lane_light = self.scene_root.attachNewNode(f"runway-line-{lane_index}")
-            self._attach_centered_box(
-                lane_light,
-                size=Vec3(0.75, 0.08, 0.012),
-                color=Vec4(0.26, 0.32, 0.38, 1.0),
-            )
-            lane_light.setPos(2.4 + lane_index * 6.0, 0.0, 0.105)
+        return
 
     def _build_ramp(self) -> None:
         for index, (segment_np, _, segment) in enumerate(self.simulation.ramp_nodes):
+            center_distance = segment.start_distance + segment.length * 0.5
+            lane_width = lane_surface_width(self.sim_config, center_distance)
             ramp = self.scene_root.attachNewNode(f"ramp-{index}")
             ramp.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
             ramp.setPos(segment_np.getPos())
@@ -504,7 +565,7 @@ class MarbleRampApp(ShowBase):
             surface = ramp.attachNewNode("surface")
             self._attach_centered_box(
                 surface,
-                size=Vec3(segment.length * 0.99, self.sim_config.width * 0.82, 0.028),
+                size=Vec3(segment.length * 0.99, lane_width * 0.82, 0.028),
                 color=Vec4(0.17, 0.18, 0.20, 1.0),
                 style="track",
             )
@@ -513,7 +574,7 @@ class MarbleRampApp(ShowBase):
             lane = ramp.attachNewNode("lane")
             self._attach_centered_box(
                 lane,
-                size=Vec3(segment.length * 0.92, self.sim_config.width * 0.08, 0.014),
+                size=Vec3(segment.length * 0.92, max(0.06, lane_width * 0.10), 0.014),
                 color=Vec4(0.82, 0.84, 0.88, 1.0),
                 style="screen",
             )
@@ -522,7 +583,7 @@ class MarbleRampApp(ShowBase):
             deck = ramp.attachNewNode("deck")
             self._attach_centered_box(
                 deck,
-                size=Vec3(segment.length * 0.90, self.sim_config.width * 0.42, 0.12),
+                size=Vec3(segment.length * 0.90, lane_width * 0.42, 0.12),
                 color=Vec4(0.08, 0.10, 0.12, 1.0),
                 style="panel",
             )
@@ -536,7 +597,7 @@ class MarbleRampApp(ShowBase):
                     color=Vec4(0.24, 0.26, 0.30, 1.0),
                     style="screen",
                 )
-                trim.setPos(0.0, side * (self.sim_config.width * 0.41), self.sim_config.ramp_thickness * 0.43)
+                trim.setPos(0.0, side * (lane_width * 0.41), self.sim_config.ramp_thickness * 0.43)
 
                 skirt = ramp.attachNewNode(f"skirt-{side}")
                 self._attach_centered_box(
@@ -545,13 +606,13 @@ class MarbleRampApp(ShowBase):
                     color=Vec4(0.10, 0.12, 0.15, 1.0),
                     style="panel",
                 )
-                skirt.setPos(0.0, side * (self.sim_config.width * 0.34), -0.04)
+                skirt.setPos(0.0, side * (lane_width * 0.34), -0.04)
 
             support = ramp.attachNewNode("support")
             self._load_styled_model(
                 support,
                 "box",
-                scale=Vec3(segment.length * 0.16, self.sim_config.width * 0.18, 0.64),
+                scale=Vec3(segment.length * 0.16, lane_width * 0.18, 0.64),
                 color=Vec4(0.08, 0.10, 0.12, 1.0),
                 pos=Vec3(0.0, 0.0, -0.70),
                 style="panel",
@@ -560,7 +621,7 @@ class MarbleRampApp(ShowBase):
             underlight = support.attachNewNode("underlight")
             self._attach_centered_box(
                 underlight,
-                size=Vec3(segment.length * 0.10, self.sim_config.width * 0.36, 0.04),
+                size=Vec3(segment.length * 0.10, lane_width * 0.36, 0.04),
                 color=Vec4(0.12, 0.14, 0.18, 1.0),
                 style="screen",
             )
@@ -590,29 +651,44 @@ class MarbleRampApp(ShowBase):
             heading_deg, bank_deg = self._sample_track_angles(distance)
             center = ramp_surface_point(self.sim_config, distance)
             normal = ramp_normal(self.sim_config, distance)
+            lane_width = lane_surface_width(self.sim_config, distance)
+            lane_offsets = lane_center_offsets(self.sim_config, distance)
 
-            skin = self.scene_root.attachNewNode(f"track-skin-{index}")
-            skin.setPos(center + normal * 0.016)
-            skin.setHpr(heading_deg, bank_deg, self.sim_config.angle_deg)
+            for lane_index, lane_offset in enumerate(lane_offsets):
+                skin = self.scene_root.attachNewNode(f"track-skin-{index}-{lane_index}")
+                skin.setPos(center + ramp_side(self.sim_config, distance) * lane_offset + normal * 0.016)
+                skin.setHpr(heading_deg, bank_deg, self.sim_config.angle_deg)
 
-            lane = skin.attachNewNode("lane-ribbon")
-            self._attach_centered_box(
-                lane,
-                size=Vec3(slice_length * 0.96, self.sim_config.width * 0.045, 0.010),
-                color=Vec4(0.72, 0.74, 0.78, 1.0),
-                style="screen",
-            )
-            lane.setZ(0.004)
-
-            for side in (-1, 1):
-                trim = skin.attachNewNode(f"trim-{side}")
+                lane = skin.attachNewNode("lane-ribbon")
                 self._attach_centered_box(
-                    trim,
-                    size=Vec3(slice_length * 0.98, 0.032, 0.030),
-                    color=Vec4(0.38, 0.40, 0.44, 1.0),
+                    lane,
+                    size=Vec3(slice_length * 0.96, max(0.05, lane_width * 0.09), 0.010),
+                    color=Vec4(0.72, 0.74, 0.78, 1.0),
                     style="screen",
                 )
-                trim.setPos(0.0, side * (self.sim_config.width * 0.418), 0.006)
+                lane.setZ(0.004)
+
+                for side in (-1, 1):
+                    trim = skin.attachNewNode(f"trim-{side}")
+                    self._attach_centered_box(
+                        trim,
+                        size=Vec3(slice_length * 0.98, 0.032, 0.030),
+                        color=Vec4(0.38, 0.40, 0.44, 1.0),
+                        style="screen",
+                    )
+                    trim.setPos(0.0, side * (lane_width * 0.418), 0.006)
+
+            gap_width = split_gap_width(self.sim_config, distance)
+            if gap_width > 0.0:
+                gap_shadow = self.scene_root.attachNewNode(f"track-gap-{index}")
+                gap_shadow.setPos(center + normal * -0.045)
+                gap_shadow.setHpr(heading_deg, bank_deg, self.sim_config.angle_deg)
+                self._attach_centered_box(
+                    gap_shadow,
+                    size=Vec3(slice_length * 0.92, gap_width * 0.92, 0.040),
+                    color=Vec4(0.04, 0.05, 0.07, 1.0),
+                    style="panel",
+                )
 
     def _build_rails(self) -> None:
         for index, (rail_np, _, segment, lateral_offset) in enumerate(self.simulation.rail_nodes):
@@ -878,19 +954,33 @@ class MarbleRampApp(ShowBase):
             "eraser": Vec4(0.84, 0.40, 0.94, 1.0),
             "pen": Vec4(0.18, 0.70, 0.94, 1.0),
             "ruler": Vec4(0.96, 0.74, 0.20, 1.0),
+            "pendulum": Vec4(0.96, 0.50, 0.22, 1.0),
+            "sweeper": Vec4(0.22, 0.86, 0.96, 1.0),
+            "fork-divider": Vec4(0.96, 0.82, 0.24, 1.0),
         }
         for obstacle in self.sim_config.obstacles:
             self._build_obstacle(obstacle, colors.get(obstacle.kind, Vec4(0.45, 0.45, 0.45, 1.0)))
 
     def _build_obstacle(self, obstacle: GuideObstacle, color: Vec4) -> None:
-        self._build_obstacle_marker(obstacle, color)
+        marker = self._build_obstacle_marker(obstacle, color)
         obstacle_np = self.scene_root.attachNewNode("obstacle")
-        self._attach_obstacle_visual(obstacle_np, obstacle, color)
+        arm = self._attach_obstacle_visual(obstacle_np, obstacle, color)
         segment = ramp_segment_at_distance(self.sim_config, obstacle.distance_along_ramp)
-        obstacle_np.setHpr(segment.heading_deg + obstacle.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
-        obstacle_np.setPos(obstacle_center_position(self.sim_config, obstacle))
+        if obstacle.motion_kind == "pendulum":
+            surface = ramp_surface_point(self.sim_config, obstacle.distance_along_ramp)
+            side = ramp_side(self.sim_config, obstacle.distance_along_ramp)
+            normal = ramp_normal(self.sim_config, obstacle.distance_along_ramp)
+            pivot_height = obstacle.pivot_height if obstacle.pivot_height > 0.0 else 1.05
+            obstacle_np.setPos(surface + side * obstacle.lateral_offset + normal * pivot_height)
+            obstacle_np.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
+        else:
+            center, heading_deg = obstacle_pose(self.sim_config, obstacle, 0.0)
+            obstacle_np.setHpr(segment.heading_deg + heading_deg, segment.bank_deg, self.sim_config.angle_deg)
+            obstacle_np.setPos(center)
+        if obstacle.motion_kind != "static":
+            self.moving_obstacle_visuals.append(MovingObstacleVisual(obstacle=obstacle, root=obstacle_np, marker=marker, arm=arm))
 
-    def _build_obstacle_marker(self, obstacle: GuideObstacle, color: Vec4) -> None:
+    def _build_obstacle_marker(self, obstacle: GuideObstacle, color: Vec4) -> NodePath:
         marker_distance = max(0.9, obstacle.distance_along_ramp - max(0.9, obstacle.length * 1.05))
         segment = ramp_segment_at_distance(self.sim_config, marker_distance)
         marker = self.scene_root.attachNewNode("obstacle-marker")
@@ -926,8 +1016,57 @@ class MarbleRampApp(ShowBase):
             depth_offset=3,
         )
         center_line.setZ(0.018)
+        return marker
 
-    def _attach_obstacle_visual(self, parent: NodePath, obstacle: GuideObstacle, color: Vec4) -> None:
+    def _attach_obstacle_visual(self, parent: NodePath, obstacle: GuideObstacle, color: Vec4) -> NodePath | None:
+        if obstacle.kind == "fork-divider":
+            self._attach_centered_box(parent, size=Vec3(obstacle.length, obstacle.width, obstacle.height), color=color, style="panel")
+            fin = parent.attachNewNode("divider-fin")
+            self._attach_centered_box(
+                fin,
+                size=Vec3(obstacle.length * 0.74, obstacle.width * 0.34, obstacle.height * 1.55),
+                color=Vec4(0.18, 0.20, 0.24, 1.0),
+                style="panel",
+            )
+            fin.setPos(0.0, 0.0, obstacle.height * 0.52)
+            return None
+
+        if obstacle.kind == "pendulum":
+            pivot_height = obstacle.pivot_height if obstacle.pivot_height > 0.0 else 1.05
+            rod_length = max(obstacle.height * 0.5 + 0.16, pivot_height - obstacle.height * 0.5)
+            arm = parent.attachNewNode("pendulum-arm")
+            rod = arm.attachNewNode("pendulum-rod")
+            self._attach_centered_box(
+                rod,
+                size=Vec3(0.08, 0.08, rod_length),
+                color=Vec4(0.16, 0.18, 0.22, 1.0),
+                style="panel",
+            )
+            rod.setPos(0.0, 0.0, -rod_length * 0.5)
+            bob = arm.attachNewNode("pendulum-bob")
+            self._attach_centered_box(bob, size=Vec3(obstacle.length, obstacle.width, obstacle.height), color=color, style="panel")
+            bob.setZ(-rod_length)
+            return arm
+
+        if obstacle.kind == "sweeper":
+            boom = parent.attachNewNode("sweeper-boom")
+            self._attach_centered_box(
+                boom,
+                size=Vec3(obstacle.length * 1.08, obstacle.width, obstacle.height),
+                color=color,
+                style="panel",
+            )
+            boom.setZ(obstacle.height * 0.5)
+            hub = parent.attachNewNode("sweeper-hub")
+            self._attach_centered_box(
+                hub,
+                size=Vec3(0.18, 0.18, obstacle.height * 1.8),
+                color=Vec4(0.12, 0.14, 0.18, 1.0),
+                style="panel",
+            )
+            hub.setZ(obstacle.height * 0.36)
+            return None
+
         size = Vec3(obstacle.length, obstacle.width, obstacle.height)
         self._attach_centered_box(parent, size=size, color=color, style="panel")
 
@@ -957,6 +1096,7 @@ class MarbleRampApp(ShowBase):
             style="panel",
         )
         stripe.setPos(0.0, 0.0, size.z * 0.18)
+        return None
 
     def _build_desk_props(self) -> None:
         self._build_arena_shell()
@@ -991,6 +1131,42 @@ class MarbleRampApp(ShowBase):
             style="screen",
         )
         line.setZ(0.04)
+
+        glow = pad.attachNewNode("glow")
+        self._attach_centered_box(
+            glow,
+            size=Vec3(1.92, 0.72, 0.018),
+            color=Vec4(0.18, 0.74, 0.96, 1.0),
+            style="screen",
+            depth_offset=2,
+        )
+        glow.setPos(0.0, 0.0, 0.028)
+        self._register_pulse(glow, amplitude=0.28, speed=2.4, phase=0.0)
+
+        for index, x_offset in enumerate((-0.62, 0.0, 0.62)):
+            chevron = pad.attachNewNode(f"chevron-{index}")
+            self._attach_centered_box(
+                chevron,
+                size=Vec3(0.28, 0.22, 0.014),
+                color=Vec4(0.94, 0.96, 1.0, 1.0),
+                style="screen",
+                depth_offset=3,
+            )
+            chevron.setPos(x_offset, 0.0, 0.042)
+            chevron.setH(45.0)
+            self._register_pulse(chevron, amplitude=0.22, speed=3.0, phase=index * 0.24)
+
+        for side in (-1, 1):
+            beacon = pad.attachNewNode(f"start-beacon-{side}")
+            self._attach_centered_box(
+                beacon,
+                size=Vec3(0.12, 0.12, 0.52),
+                color=Vec4(0.24, 0.82, 0.98, 1.0),
+                style="screen",
+                depth_offset=2,
+            )
+            beacon.setPos(0.0, side * 0.82, 0.26)
+            self._register_pulse(beacon, amplitude=0.30, speed=2.7, phase=0.2 if side > 0 else 0.6)
 
     def _build_sheet(self, pos: Vec3, size: Vec3, heading: float) -> None:
         sheet = self.scene_root.attachNewNode("sheet")
@@ -1216,16 +1392,221 @@ class MarbleRampApp(ShowBase):
             color=Vec4(0.08, 0.10, 0.14, 1.0),
             pos=Vec3(self.sim_config.marble_radius, 0.0, 0.0),
         )
-        for index in range(1):
+        for index in range(2):
             line = self.marble_root.attachNewNode(f"speed-line-{index}")
             self._attach_centered_box(
                 line,
                 size=Vec3(self.sim_config.marble_radius * 1.5, 0.016, 0.016),
                 color=Vec4(0.76, 0.80, 0.86, 1.0),
             )
-            line.setPos(-self.sim_config.marble_radius * 1.1, 0.0, -0.02)
+            line.setPos(
+                -self.sim_config.marble_radius * (1.1 + index * 0.45),
+                0.0,
+                -0.02 + index * 0.012,
+            )
             self.speed_lines.append(line)
         self._build_ghost_marker()
+
+    def _clear_bot_marbles(self) -> None:
+        for bot in self.bot_marbles:
+            if hasattr(self, "simulation") and self.simulation is not None:
+                self.simulation.world.removeRigidBody(bot.body)
+            if not bot.body_np.isEmpty():
+                bot.body_np.removeNode()
+            if not bot.visual_root.isEmpty():
+                bot.visual_root.removeNode()
+        self.bot_marbles = []
+
+    def _spawn_bot_marbles(self) -> None:
+        self._clear_bot_marbles()
+        if self.active_mode != self.MODE_BOT_RACE:
+            return
+        bot_specs = [
+            ("BOT-1", -0.24, -0.12, Vec4(0.96, 0.44, 0.22, 1.0)),
+            ("BOT-2", 0.24, 0.10, Vec4(0.22, 0.78, 0.96, 1.0)),
+        ]
+        for index, (name, lane_offset, speed_bias, color) in enumerate(bot_specs):
+            body = BulletRigidBodyNode(f"bot-marble-{index}")
+            body.addShape(BulletSphereShape(self.sim_config.marble_radius))
+            body.setMass(self.sim_config.marble_mass)
+            body.setFriction(self.sim_config.marble_friction)
+            body.setRestitution(self.sim_config.restitution)
+            body.setLinearDamping(0.012)
+            body.setAngularDamping(0.014)
+            body.setCcdMotionThreshold(1e-7)
+            body.setCcdSweptSphereRadius(self.sim_config.marble_radius * 0.98)
+            body_np = self.simulation.root.attachNewNode(body)
+            self.simulation.world.attachRigidBody(body)
+
+            visual_root = self.scene_root.attachNewNode(f"bot-visual-{index}")
+            self._load_styled_model(
+                visual_root,
+                "sphere",
+                scale=Vec3(self.sim_config.marble_radius * 0.96),
+                color=color,
+            )
+            stripe = visual_root.attachNewNode("stripe")
+            self._load_styled_model(
+                stripe,
+                "sphere",
+                scale=Vec3(self.sim_config.marble_radius * 0.64),
+                color=Vec4(0.96, 0.98, 1.0, 1.0),
+                pos=Vec3(self.sim_config.marble_radius * 0.16, 0.0, 0.0),
+            )
+            marker = visual_root.attachNewNode("marker")
+            self._load_styled_model(
+                marker,
+                "sphere",
+                scale=Vec3(self.sim_config.marble_radius * 0.18),
+                color=Vec4(0.10, 0.12, 0.16, 1.0),
+                pos=Vec3(self.sim_config.marble_radius * 0.94, 0.0, 0.0),
+            )
+            self.bot_marbles.append(
+                BotMarble(
+                    name=name,
+                    body_np=body_np,
+                    body=body,
+                    visual_root=visual_root,
+                    lane_offset=lane_offset,
+                    speed_bias=speed_bias,
+                )
+            )
+        self._reset_bot_marbles()
+
+    def _reset_bot_body(self, bot: BotMarble, *, distance: float) -> None:
+        spawn_distance = max(0.0, min(self.sim_config.length - 1.0, distance))
+        surface = ramp_surface_point(self.sim_config, spawn_distance)
+        side = ramp_side(self.sim_config, spawn_distance)
+        normal = ramp_normal(self.sim_config, spawn_distance)
+        start_pos = surface + side * bot.lane_offset + normal * (self.sim_config.marble_radius + 0.01)
+        bot.body_np.setPos(start_pos)
+        bot.body_np.setQuat(NodePath("identity").getQuat())
+        bot.body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
+        bot.body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
+        bot.body.clearForces()
+        bot.progress = spawn_distance
+        bot.finish_time = None
+        bot.finish_order = None
+        bot.off_track_timer = 0.0
+        bot.fall_timer = 0.0
+        bot.reset_warning_second = None
+        bot.previous_position = Vec3(start_pos)
+        bot.previous_progress = spawn_distance
+        bot.active_boost_pad_index = None
+        bot.last_boost_pad_index = None
+
+    def _reset_bot_marbles(self) -> None:
+        spawn_distances = (0.0, 0.0)
+        for index, bot in enumerate(self.bot_marbles):
+            self._reset_bot_body(bot, distance=spawn_distances[min(index, len(spawn_distances) - 1)])
+        self._update_bot_visuals()
+
+    def _bot_lane_target_offset(self, distance: float, preferred_offset: float) -> float:
+        lane_offsets = lane_center_offsets(self.sim_config, distance)
+        if len(lane_offsets) == 1:
+            return preferred_offset
+        preferred_sign = -1.0 if preferred_offset < 0.0 else 1.0
+        matching_lanes = [lane_offset for lane_offset in lane_offsets if lane_offset * preferred_sign > 0.0]
+        if matching_lanes:
+            return min(matching_lanes, key=lambda lane_offset: abs(lane_offset - preferred_offset))
+        return min(lane_offsets, key=lambda lane_offset: abs(lane_offset - preferred_offset))
+
+    def _settle_start_grid(self, *, settle_steps: int = 24, dt: float = 1.0 / 960.0) -> None:
+        if settle_steps <= 0 or dt <= 0.0:
+            return
+        for _ in range(settle_steps):
+            self.simulation.world.doPhysics(dt, 1, dt)
+        self.simulation.marble_body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
+        self.simulation.marble_body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
+        self.simulation.marble_body.clearForces()
+        for bot in self.bot_marbles:
+            bot.body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
+            bot.body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
+            bot.body.clearForces()
+            bot.previous_position = Vec3(bot.body_np.getPos())
+            bot.previous_progress = bot.progress
+        self._update_bot_visuals()
+
+    def _update_bot_controllers(self, dt: float) -> None:
+        if self.active_mode != self.MODE_BOT_RACE:
+            return
+        mass = self.sim_config.marble_mass
+        for bot in self.bot_marbles:
+            if bot.finish_time is not None:
+                continue
+            position = bot.body_np.getPos()
+            bot.previous_position = Vec3(position)
+            bot.previous_progress = bot.progress
+            near_progress = path_distance_for_position_near(self.sim_config, position, bot.progress)
+            absolute_progress = path_distance_for_position(self.sim_config, position)
+            progress_candidate = near_progress
+            if abs(absolute_progress - near_progress) <= 4.0:
+                progress_candidate = max(progress_candidate, absolute_progress)
+            bot.progress = max(bot.progress, progress_candidate)
+            velocity = bot.body.getLinearVelocity()
+            lookahead_distance = min(self.sim_config.length, bot.progress + 1.4)
+            target_tangent = ramp_tangent(self.sim_config, lookahead_distance)
+            if target_tangent.length_squared() <= 1e-9:
+                continue
+            target_tangent.normalize()
+            target_side = ramp_side(self.sim_config, lookahead_distance)
+            target_normal = ramp_normal(self.sim_config, lookahead_distance)
+            target_lane_offset = self._bot_lane_target_offset(lookahead_distance, bot.lane_offset)
+            target_point = (
+                ramp_surface_point(self.sim_config, lookahead_distance)
+                + target_side * target_lane_offset
+                + target_normal * (self.sim_config.marble_radius + 0.01)
+            )
+            relative = target_point - position
+            forward_speed = velocity.dot(target_tangent)
+            lateral_speed = velocity.dot(target_side)
+            vertical_speed = velocity.dot(target_normal)
+            target_speed = 6.2 + bot.speed_bias + min(2.6, bot.progress / max(self.sim_config.length, 1e-6) * 2.8)
+            forward_force = max(0.0, target_speed - forward_speed) * mass * 4.0
+            lateral_force = (relative.dot(target_side) * 7.4 - lateral_speed * 2.2) * mass
+            bot.body.applyCentralForce(target_tangent * forward_force + target_side * lateral_force)
+            active_boost = self._boost_pad_at_position(position, airborne=False)
+            bot.active_boost_pad_index = active_boost[0] if active_boost is not None else None
+            if active_boost is not None:
+                pad_index, boost_pad = active_boost
+                bot.body.setLinearVelocity(velocity + target_tangent * (boost_pad.acceleration * dt))
+                if pad_index != bot.last_boost_pad_index and pad_index < len(self.boost_pads):
+                    self._pulse_boost_pad(self.boost_pads[pad_index])
+            bot.last_boost_pad_index = bot.active_boost_pad_index
+            if relative.dot(target_normal) < -0.02 or vertical_speed > 0.55:
+                bot.body.applyCentralForce(-target_normal * mass * 2.2)
+
+    def _update_bot_race_state(self) -> None:
+        if self.active_mode != self.MODE_BOT_RACE:
+            return
+        for bot in self.bot_marbles:
+            if bot.finish_time is not None:
+                continue
+            position = bot.body_np.getPos()
+            absolute_progress = path_distance_for_position(self.sim_config, position)
+            bot.progress = max(
+                bot.progress,
+                absolute_progress,
+                path_distance_for_position_near(self.sim_config, position, bot.progress),
+            )
+            if bot.previous_position is not None:
+                previous_state = type("BotState", (), {})()
+                previous_state.position = bot.previous_position
+                previous_state.path_distance = bot.previous_progress
+                current_state = type("BotState", (), {})()
+                current_state.position = position
+                current_state.path_distance = bot.progress
+                if self._should_finish_run(previous_state, current_state):
+                    bot.finish_time = self.simulation.time
+                    bot.finish_order = self._claim_finish_order()
+                    continue
+
+    def _update_bot_visuals(self) -> None:
+        for bot in self.bot_marbles:
+            if bot.visual_root.isEmpty():
+                continue
+            bot.visual_root.setPos(bot.body_np.getPos())
+            bot.visual_root.setQuat(bot.body_np.getQuat())
 
     def _build_ghost_marker(self) -> None:
         if self.ghost_playback is not None and not self.ghost_playback.root.isEmpty():
@@ -1325,11 +1706,11 @@ class MarbleRampApp(ShowBase):
             mayChange=True,
         )
         self.controls = OnscreenText(
-            text="Up/Down menu   Left/Right steer   Down brake   Space start/pause   M menu   R restart   Esc quit",
+            text="Up/Down mode   Left/Right track   Space start/pause   M menu   R restart   Esc quit",
             pos=(0.0, -0.94),
             scale=0.030,
             fg=(0.70, 0.74, 0.80, 1.0),
-            mayChange=False,
+            mayChange=True,
         )
         self.debug_text = OnscreenText(
             text="",
@@ -1395,7 +1776,7 @@ class MarbleRampApp(ShowBase):
             self.selected_level_index = 0
             self._load_level_progress()
             self._show_event(
-                "TRACK SELECT",
+                "MODE SELECT",
                 "Progress reset with --reset-progress only",
                 Vec4(0.92, 0.94, 0.98, 1.0),
                 hold=2.0,
@@ -1404,7 +1785,12 @@ class MarbleRampApp(ShowBase):
         self._reset()
 
     def _set_steering(self, direction: float) -> None:
+        if self.race_phase == "menu":
+            self._menu_change_track(-1 if direction > 0.0 else 1)
+            return
         if self.race_phase != "running":
+            return
+        if self.start_input_lock_timer > 0.0:
             return
         self.steering_input = direction
         self.simulation.set_steering_input(direction)
@@ -1417,19 +1803,29 @@ class MarbleRampApp(ShowBase):
     def _set_brake(self, amount: float) -> None:
         if self.race_phase != "running":
             return
+        if self.start_input_lock_timer > 0.0:
+            self.brake_input = 0.0
+            self.simulation.set_brake_input(0.0)
+            return
         self.brake_input = amount
         self.simulation.set_brake_input(amount)
 
     def _on_up_press(self) -> None:
-        self._menu_move(-1)
+        if self.race_phase == "menu":
+            self._menu_change_mode(-1)
 
     def _on_down_press(self) -> None:
         if self.race_phase == "menu":
-            self._menu_move(1)
+            self._menu_change_mode(1)
             return
         self._set_brake(1.0)
 
-    def _menu_move(self, delta: int) -> None:
+    def _menu_change_mode(self, delta: int) -> None:
+        if self.race_phase != "menu":
+            return
+        self.selected_mode_index = (self.selected_mode_index + delta) % len(self.MODE_OPTIONS)
+
+    def _menu_change_track(self, delta: int) -> None:
         if self.race_phase != "menu":
             return
         self.selected_level_index = (self.selected_level_index + delta) % len(self.levels)
@@ -1490,7 +1886,7 @@ class MarbleRampApp(ShowBase):
             self.ghost_playback.root.hide()
 
     def _record_ghost_sample(self, time_s: float) -> None:
-        if self.race_phase != "running":
+        if self.active_mode != self.MODE_TIME_TRIAL or self.race_phase != "running":
             return
         if self.pending_ghost_samples and time_s - self._last_ghost_sample_time < 0.05:
             return
@@ -1501,6 +1897,10 @@ class MarbleRampApp(ShowBase):
         self._last_ghost_sample_time = time_s
 
     def _update_ghost_playback(self, time_s: float) -> None:
+        if self.active_mode != self.MODE_TIME_TRIAL:
+            if self.ghost_playback is not None:
+                self.ghost_playback.root.hide()
+            return
         if self.ghost_playback is None or not self.ghost_playback.samples:
             return
         if self.race_phase in {"menu", "failed"}:
@@ -1530,8 +1930,10 @@ class MarbleRampApp(ShowBase):
 
     def _reset_run_state(self) -> None:
         self.race_phase = "countdown"
-        self.countdown_timer = 3.6
+        self.countdown_timer = 3.1
         self.last_countdown_value = int(ceil(self.countdown_timer))
+        self.finish_order_counter = 0
+        self.last_finish_place = None
         self.finish_time = None
         self.finish_grade = None
         self.failure_reason = None
@@ -1544,6 +1946,8 @@ class MarbleRampApp(ShowBase):
         self.boost_chain = 0
         self.best_boost_chain = 0
         self.off_track_timer = 0.0
+        self.player_fall_timer = 0.0
+        self.player_reset_warning_second = None
         self.last_supported_path_distance = 0.0
         self.impact_event_cooldown = 0.0
         self.next_section_index = 0
@@ -1553,12 +1957,15 @@ class MarbleRampApp(ShowBase):
         self.flash_alpha = 0.0
         self.boost_flash = 0.0
         self.finish_flash = 0.0
+        self.start_burst = 0.0
+        self.start_input_lock_timer = 0.0
+        self.launch_assist_timer = 0.0
+        self._clear_finish_confetti()
         self.pending_ghost_samples = []
         self._last_ghost_sample_time = 0.0
         self._stall_timer = 0.0
         self._show_event("3", "", Vec4(0.92, 0.94, 0.98, 1.0), hold=10.0)
         for pad in self.boost_pads:
-            pad.spent = False
             pad.pulse = 0.0
 
     def _reset(self) -> None:
@@ -1567,6 +1974,8 @@ class MarbleRampApp(ShowBase):
         self.paused = False
         self.steering_input = 0.0
         self.brake_input = 0.0
+        self.start_input_lock_timer = 0.0
+        self.launch_assist_timer = 0.0
         self.simulation.set_steering_input(0.0)
         self.simulation.set_brake_input(0.0)
         start_pos = self.simulation.snapshot().position
@@ -1581,6 +1990,8 @@ class MarbleRampApp(ShowBase):
         self.camera_roll = 0.0
         self.camera_focus = Vec3(start_pos)
         self.camera_look_target = Vec3(start_pos) + self.camera_forward * self.camera_look_ahead
+        self._reset_bot_marbles()
+        self._settle_start_grid()
         self._reset_run_state()
         self._update_ghost_playback(0.0)
         self._apply_state(1.0 / 60.0)
@@ -1589,7 +2000,10 @@ class MarbleRampApp(ShowBase):
         self.flash_alpha = max(0.0, self.flash_alpha - dt * 1.7)
         self.boost_flash = max(0.0, self.boost_flash - dt * 1.8)
         self.finish_flash = max(0.0, self.finish_flash - dt * 0.75)
+        self.start_burst = max(0.0, self.start_burst - dt * 1.35)
         self.impact_event_cooldown = max(0.0, self.impact_event_cooldown - dt)
+        self.start_input_lock_timer = max(0.0, self.start_input_lock_timer - dt)
+        self.launch_assist_timer = max(0.0, self.launch_assist_timer - dt)
         if self.event_timer > 0.0:
             self.event_timer = max(0.0, self.event_timer - dt)
         elif self.race_phase == "running":
@@ -1603,22 +2017,327 @@ class MarbleRampApp(ShowBase):
         countdown_value = min(3, max(1, int(ceil(self.countdown_timer))))
         if self.countdown_timer > 0.0 and countdown_value != self.last_countdown_value:
             self.last_countdown_value = countdown_value
-            self._show_event(
-                str(countdown_value),
-                "",
-                Vec4(0.92, 0.94, 0.98, 1.0),
-                hold=10.0,
-            )
+            if countdown_value == 2:
+                self.start_burst = max(self.start_burst, 0.16)
+                self._show_event("2", "HOLD", Vec4(0.98, 0.82, 0.34, 1.0), hold=10.0)
+                self._trigger_flash(Vec4(0.98, 0.82, 0.34, 1.0), 0.12)
+            elif countdown_value == 1:
+                self.start_burst = max(self.start_burst, 0.24)
+                self._show_event("1", "PUNCH IT", Vec4(0.96, 0.56, 0.22, 1.0), hold=10.0)
+                self._trigger_flash(Vec4(0.96, 0.56, 0.22, 1.0), 0.16)
         if self.countdown_timer <= 0.0:
             self.race_phase = "running"
-            self.simulation.add_forward_speed(1.35)
-            self._show_event("GO!", "", Vec4(0.92, 0.94, 0.98, 1.0), hold=0.9)
+            self.simulation.marble_body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
+            self.simulation.marble_body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
+            self.simulation.marble_body.clearForces()
+            self.simulation.add_forward_speed(3.20)
+            self.start_input_lock_timer = 0.22
+            self.launch_assist_timer = self.launch_assist_duration
+            for index, bot in enumerate(self.bot_marbles):
+                bot.body.setLinearVelocity(Vec3(0.0, 0.0, 0.0))
+                bot.body.setAngularVelocity(Vec3(0.0, 0.0, 0.0))
+                bot.body.clearForces()
+                launch_speed = 1.10 + 0.08 * index + max(0.0, bot.speed_bias) * 0.14
+                tangent = ramp_tangent(self.sim_config, max(0.0, bot.progress))
+                if tangent.length_squared() > 1e-9:
+                    tangent.normalize()
+                    bot.body.setLinearVelocity(tangent * launch_speed)
+            self.start_burst = 1.0
+            self.boost_flash = max(self.boost_flash, 0.42)
+            self._show_event("GO!", "SLINGSHOT", Vec4(0.28, 0.90, 0.98, 1.0), hold=0.7)
+            self._trigger_flash(Vec4(0.28, 0.90, 0.98, 1.0), 0.24)
+
+    def _update_launch_assist(self, dt: float) -> None:
+        if self.race_phase != "running" or self.launch_assist_timer <= 0.0:
+            return
+        normalized = self.launch_assist_timer / max(self.launch_assist_duration, 1e-6)
+        assist_strength = 5.2 * normalized * normalized + 0.80
+        self.simulation.add_forward_speed(assist_strength * dt)
+        if self.start_input_lock_timer > 0.0:
+            self.steering_input = 0.0
+            self.brake_input = 0.0
+            self.simulation.set_steering_input(0.0)
+            self.simulation.set_brake_input(0.0)
+
+    def _finish_metrics(self, position: Vec3) -> tuple[float, float, float]:
+        metrics = shared_finish_metrics(
+            self.sim_config,
+            position,
+            target_distance=self.finish_line_distance,
+        )
+        return metrics.longitudinal_offset, metrics.lateral_offset, metrics.normal_offset
+
+    def _has_crossed_finish(self, position: Vec3) -> bool:
+        return shared_has_crossed_finish(
+            self.sim_config,
+            position,
+            target_distance=self.finish_line_distance,
+        )
+
+    def _boost_pad_at_position(self, position: Vec3, *, airborne: bool = False) -> tuple[int, object] | None:
+        activation_margin = self.sim_config.marble_radius
+        for index, boost_pad in enumerate(self.sim_config.boost_pads):
+            center = boost_pad_center_position(self.sim_config, boost_pad)
+            tangent = ramp_tangent(self.sim_config, boost_pad.distance_along_ramp)
+            if tangent.length_squared() <= 1e-9:
+                continue
+            tangent.normalize()
+            side = ramp_side(self.sim_config, boost_pad.distance_along_ramp)
+            normal = ramp_normal(self.sim_config, boost_pad.distance_along_ramp)
+            relative = position - center
+            longitudinal_offset = abs(relative.dot(tangent))
+            lateral_offset = abs(relative.dot(side))
+            normal_offset = relative.dot(normal)
+            if longitudinal_offset > boost_pad.length * 0.5 + activation_margin:
+                continue
+            if lateral_offset > boost_pad.width * 0.5 + activation_margin:
+                continue
+            if normal_offset < -0.12 or normal_offset > activation_margin * 1.8:
+                continue
+            if airborne and normal_offset > activation_margin * 0.8:
+                continue
+            return index, boost_pad
+        return None
+
+    def _track_relative_offsets(self, position: Vec3, reference_distance: float) -> tuple[float, float, float]:
+        return shared_track_relative_offsets(self.sim_config, position, reference_distance)
+
+    def _is_definitely_off_track(self, position: Vec3, reference_distance: float) -> bool:
+        return shared_is_definitely_off_track(self.sim_config, position, reference_distance)
+
+    def _effective_track_distance(self, position: Vec3, reference_distance: float) -> float:
+        return shared_effective_track_distance(self.sim_config, position, reference_distance)
+
+    def _is_below_track_freefall(
+        self,
+        position: Vec3,
+        *,
+        reference_distance: float,
+        contacts: int,
+        velocity: Vec3,
+    ) -> bool:
+        nearest_distance = self._nearest_track_distance(position, reference_distance)
+        surface = ramp_surface_point(self.sim_config, nearest_distance)
+        lateral_offset, normal_offset, _ = self._track_relative_offsets(position, nearest_distance)
+        below_surface = position.z < surface.z - 0.85 or normal_offset < -0.70
+        far_from_lane = lateral_offset > self.sim_config.width * 0.5 + 0.25
+        falling_fast = velocity.z < -7.0
+        return contacts == 0 and below_surface and falling_fast and (far_from_lane or position.z < surface.z - 1.05)
+
+    def _respawn_player_to_start(self) -> None:
+        self.simulation.respawn_marble(distance=0.0)
+        self.simulation.settle_start_contact(settle_steps=16)
+        self.simulation.set_steering_input(0.0)
+        self.simulation.set_brake_input(0.0)
+        self.steering_input = 0.0
+        self.brake_input = 0.0
+        self.player_fall_timer = 0.0
+        self.player_reset_warning_second = None
+        self.off_track_timer = 0.0
+        self._stall_timer = 0.0
+        self.launch_assist_timer = 0.0
+        self.start_input_lock_timer = 0.0
+        start_pos = self.simulation.snapshot().position
+        self.camera_track_distance = 0.0
+        self.camera_focus = Vec3(start_pos)
+        self.camera_look_target = Vec3(start_pos) + self.camera_forward * self.camera_look_ahead
+        self._show_event("RESET", "BACK TO START", Vec4(0.98, 0.82, 0.34, 1.0), hold=0.9)
+
+    def _update_player_fall_reset(self, previous_state, state, dt: float) -> bool:
+        if self.race_phase != "running":
+            self.player_fall_timer = 0.0
+            self.player_reset_warning_second = None
+            return False
+        reference_distance = max(previous_state.path_distance, state.path_distance)
+        if self._is_below_track_freefall(
+            state.position,
+            reference_distance=reference_distance,
+            contacts=state.total_contacts,
+            velocity=state.linear_velocity,
+        ):
+            self.player_fall_timer += dt
+            remaining = max(0.0, self.fall_reset_delay - self.player_fall_timer)
+            warning_second = max(1, int(ceil(remaining))) if remaining > 0.0 else 0
+            if warning_second > 0 and warning_second != self.player_reset_warning_second:
+                self.player_reset_warning_second = warning_second
+                self._show_event(
+                    f"RESET {warning_second}",
+                    "FREEFALL DETECTED",
+                    Vec4(0.96, 0.56, 0.22, 1.0),
+                    hold=0.45,
+                )
+            if self.player_fall_timer >= self.fall_reset_delay:
+                self._respawn_player_to_start()
+                return True
+        else:
+            self.player_fall_timer = 0.0
+            self.player_reset_warning_second = None
+        return False
+
+    def _update_bot_fall_resets(self, dt: float) -> None:
+        if self.active_mode != self.MODE_BOT_RACE:
+            return
+        for bot in self.bot_marbles:
+            if bot.finish_time is not None:
+                continue
+            position = bot.body_np.getPos()
+            contacts = self.simulation.world.contactTest(bot.body).getNumContacts()
+            if self._is_below_track_freefall(
+                position,
+                reference_distance=bot.progress,
+                contacts=contacts,
+                velocity=bot.body.getLinearVelocity(),
+            ):
+                bot.fall_timer += dt
+                remaining = max(0.0, self.fall_reset_delay - bot.fall_timer)
+                warning_second = max(1, int(ceil(remaining))) if remaining > 0.0 else 0
+                if warning_second > 0 and warning_second != bot.reset_warning_second:
+                    bot.reset_warning_second = warning_second
+                    self._show_event(
+                        f"{bot.name} {warning_second}",
+                        "RESETTING",
+                        Vec4(0.94, 0.68, 0.28, 1.0),
+                        hold=0.35,
+                    )
+                if bot.fall_timer >= self.fall_reset_delay:
+                    self._reset_bot_body(bot, distance=0.0)
+                    bot.previous_position = Vec3(bot.body_np.getPos())
+                    bot.previous_progress = bot.progress
+            else:
+                bot.fall_timer = 0.0
+                bot.reset_warning_second = None
+
+    def _nearest_track_distance(self, position: Vec3, reference_distance: float) -> float:
+        clamped_reference = max(0.0, min(self.sim_config.length, reference_distance))
+        return path_distance_for_position_near(
+            self.sim_config,
+            position,
+            clamped_reference,
+            search_radius_segments=32,
+        )
+
+    def _off_track_status(
+        self,
+        position: Vec3,
+        *,
+        reference_distance: float,
+        contacts: int,
+        airborne: bool,
+        impact_severity: float,
+        previous_contacts: int = 0,
+        previous_impact_severity: float = 0.0,
+    ) -> tuple[float, bool, bool]:
+        nearest_distance = self._nearest_track_distance(position, reference_distance)
+        lateral_offset, normal_offset, z_drop = self._track_relative_offsets(position, nearest_distance)
+        unsupported = contacts == 0 and airborne
+        recovering = (
+            contacts > 0
+            or previous_contacts > 0
+            or impact_severity >= 0.34
+            or previous_impact_severity >= 0.34
+        )
+        lane_half_width = self.sim_config.width * 0.5
+        far_outside = lateral_offset > lane_half_width + max(1.15, self.sim_config.marble_radius * 5.0)
+        outside_lane = lateral_offset > lane_half_width + max(0.48, self.sim_config.marble_radius * 2.2)
+        deep_below_track = normal_offset < -1.30 or z_drop < -1.70 or position.z < -3.0
+        below_track = normal_offset < -0.42 or z_drop < -0.58
+        definitely_lost = unsupported and (deep_below_track or far_outside or (outside_lane and below_track))
+        maybe_lost = unsupported and outside_lane and below_track and not recovering
+        if recovering:
+            severity = 0.0
+        elif definitely_lost:
+            severity = 2.4
+        elif maybe_lost:
+            severity = 1.0
+        else:
+            severity = 0.0
+        return severity, recovering, definitely_lost
+
+    def _should_finish_run(self, previous_state, state) -> bool:
+        return shared_should_finish_run(
+            self.sim_config,
+            previous_state.position,
+            previous_state.path_distance,
+            state.position,
+            state.path_distance,
+            target_distance=self.finish_line_distance,
+        )
+
+    def _claim_finish_order(self) -> int:
+        self.finish_order_counter += 1
+        return self.finish_order_counter
+
+    def _bot_race_placement(self) -> int:
+        return self._claim_finish_order()
+
+    def _race_standings(self, player_progress: float) -> list[tuple[str, tuple[float, float]]]:
+        racers: list[tuple[str, tuple[float, float]]] = [("YOU", (0.0, player_progress))]
+        for bot in self.bot_marbles:
+            if bot.finish_order is not None:
+                racers.append((bot.name, (1.0, -float(bot.finish_order))))
+            else:
+                racers.append((bot.name, (0.0, bot.progress)))
+        racers.sort(key=lambda item: item[1], reverse=True)
+        return racers
+
+    def _format_bot_leaderboard(self, player_progress: float) -> str:
+        standings = self._race_standings(player_progress)
+        lines: list[str] = []
+        for place, (name, ranking) in enumerate(standings, start=1):
+            finished_flag, metric = ranking
+            if finished_flag >= 1.0:
+                gap_text = "FIN"
+            else:
+                leader_metric = standings[0][1][1]
+                gap = leader_metric - metric
+                gap_text = "LEAD" if place == 1 else f"-{gap:0.1f}m"
+            lines.append(f"P{place} {name:<5} {gap_text:>5}")
+        return "\n".join(lines)
+
+    def _clear_finish_confetti(self) -> None:
+        for piece in self.finish_confetti:
+            if not piece.node.isEmpty():
+                piece.node.removeNode()
+        self.finish_confetti = []
+
+    def _spawn_finish_confetti(self, anchor: Vec3) -> None:
+        self._clear_finish_confetti()
+        palette = (
+            Vec4(0.98, 0.28, 0.34, 1.0),
+            Vec4(0.98, 0.86, 0.22, 1.0),
+            Vec4(0.22, 0.88, 0.98, 1.0),
+            Vec4(0.96, 0.96, 0.98, 1.0),
+        )
+        burst_origin = anchor + Vec3(0.0, 0.0, 0.8)
+        piece_count = 28
+        for index in range(piece_count):
+            piece_root = self.scene_root.attachNewNode(f"finish-confetti-{index}")
+            piece_root.setPos(burst_origin)
+            self._attach_centered_box(
+                piece_root,
+                size=Vec3(0.05, 0.012, 0.03),
+                color=palette[index % len(palette)],
+                style="screen",
+            )
+            angle = tau * (index / piece_count)
+            radial_speed = 2.2 + 0.7 * ((index % 5) / 4.0)
+            upward_speed = 2.8 + 1.4 * ((index % 7) / 6.0)
+            velocity = Vec3(cos(angle) * radial_speed, sin(angle) * radial_speed, upward_speed)
+            spin_hpr = Vec3(180.0 + index * 9.0, 220.0 + index * 11.0, 260.0 + index * 7.0)
+            self.finish_confetti.append(
+                ConfettiPiece(
+                    node=piece_root,
+                    velocity=velocity,
+                    spin_hpr=spin_hpr,
+                    lifetime=1.7 + 0.25 * (index % 3),
+                )
+            )
+
+    def _pulse_boost_pad(self, pad: BoostPadVisual) -> None:
+        pad.pulse = 1.0
 
     def _activate_boost_pad(self, pad: BoostPadVisual, index: int) -> None:
-        if pad.spent:
-            return
-        pad.spent = True
-        pad.pulse = 1.0
+        self._pulse_boost_pad(pad)
         self.section_boost_hits += 1
         self.boost_chain += 1
         self.best_boost_chain = max(self.best_boost_chain, self.boost_chain)
@@ -1649,7 +2368,9 @@ class MarbleRampApp(ShowBase):
     def _finish_run(self, state) -> None:
         if self.race_phase == "finished":
             return
-        if not self.pending_ghost_samples or self.pending_ghost_samples[-1].time < state.time:
+        if self.active_mode == self.MODE_TIME_TRIAL and (
+            not self.pending_ghost_samples or self.pending_ghost_samples[-1].time < state.time
+        ):
             self.pending_ghost_samples.append(
                 GhostSample.from_vec3(time=state.time, path_distance=state.path_distance, position=state.position)
             )
@@ -1657,6 +2378,7 @@ class MarbleRampApp(ShowBase):
         self.current_section_name = "Finished"
         self.current_section_focus = ""
         self.finish_time = state.time
+        self.last_finish_place = None
         previous_best = self.session_best_time
         if self.current_level.target_times is not None:
             self.finish_grade = grade_time_trial(state.time, self.current_level.target_times)
@@ -1671,17 +2393,26 @@ class MarbleRampApp(ShowBase):
                 boost_chain=self.best_boost_chain,
             )
         is_best = previous_best is None or state.time < previous_best
-        if is_best:
-            self.session_best_time = state.time
-            self.progress = update_level_progress(
-                self.progress,
-                self.current_level_key,
-                unlocked=True,
-                best_time=state.time,
-                best_medal=self.finish_grade.medal,
-                ghost=tuple(self.pending_ghost_samples),
-            )
-            save_progress(self.progress)
+        if self.active_mode == self.MODE_TIME_TRIAL:
+            if is_best:
+                self.session_best_time = state.time
+                self.progress = update_level_progress(
+                    self.progress,
+                    self.current_level_key,
+                    unlocked=True,
+                    best_time=state.time,
+                    best_medal=self.finish_grade.medal,
+                    ghost=tuple(self.pending_ghost_samples),
+                )
+                save_progress(self.progress)
+            else:
+                self.progress = update_level_progress(
+                    self.progress,
+                    self.current_level_key,
+                    unlocked=True,
+                    best_medal=self.finish_grade.medal,
+                )
+                save_progress(self.progress)
         else:
             self.progress = update_level_progress(
                 self.progress,
@@ -1692,21 +2423,30 @@ class MarbleRampApp(ShowBase):
             save_progress(self.progress)
         self._unlock_next_level()
         subtitle = format_seconds(state.time)
-        if is_best:
+        if self.active_mode == self.MODE_BOT_RACE:
+            placement = self._bot_race_placement()
+            self.last_finish_place = placement
+            subtitle += f"   P{placement}/{len(self.bot_marbles) + 1}"
+        if self.active_mode == self.MODE_TIME_TRIAL and is_best:
             subtitle += "   NEW BEST"
-        elif previous_best is not None:
+        elif self.active_mode == self.MODE_TIME_TRIAL and previous_best is not None:
             subtitle += f"   {format_delta(state.time - previous_best)}"
-        self._show_event("FINISH", subtitle, Vec4(0.92, 0.94, 0.98, 1.0), hold=60.0)
-        self.finish_flash = 0.25
+        finish_label = "FINISH"
+        if self.active_mode == self.MODE_BOT_RACE and self.last_finish_place is not None:
+            suffix = "TH"
+            if self.last_finish_place % 10 == 1 and self.last_finish_place % 100 != 11:
+                suffix = "ST"
+            elif self.last_finish_place % 10 == 2 and self.last_finish_place % 100 != 12:
+                suffix = "ND"
+            elif self.last_finish_place % 10 == 3 and self.last_finish_place % 100 != 13:
+                suffix = "RD"
+            finish_label = f"{self.last_finish_place}{suffix} PLACE"
+        self._show_event(finish_label, subtitle, Vec4(0.92, 0.94, 0.98, 1.0), hold=60.0)
+        self.finish_flash = 0.45
+        self._spawn_finish_confetti(state.position)
 
     def _should_reset_for_off_track(self, previous_state, state, dt: float) -> bool:
-        del dt
-        reference_distance = max(previous_state.path_distance, state.path_distance)
-        return is_position_off_track(
-            self.sim_config,
-            state.position,
-            reference_distance=reference_distance,
-        )
+        return False
 
     def _handle_running_state(self, previous_state, state, dt: float) -> None:
         if state.boost_active and not previous_state.boost_active:
@@ -1714,12 +2454,11 @@ class MarbleRampApp(ShowBase):
             if active_index is not None and active_index < len(self.boost_pads):
                 self._activate_boost_pad(self.boost_pads[active_index], active_index)
 
-        if state.path_distance >= self.finish_line_distance:
+        if self._should_finish_run(previous_state, state):
             self._finish_run(state)
             return
 
-        if self._should_reset_for_off_track(previous_state, state, dt):
-            self._enter_failed_state("OFF TRACK", "Press Space to retry   M for menu")
+        if self._update_player_fall_reset(previous_state, state, dt):
             return
 
         progress_delta = max(0.0, state.path_distance - previous_state.path_distance)
@@ -1761,8 +2500,12 @@ class MarbleRampApp(ShowBase):
             if self.race_phase == "countdown":
                 self._handle_countdown(dt)
             elif self.race_phase == "running":
+                self._update_launch_assist(dt)
+                self._update_bot_controllers(dt)
                 previous_state = self.simulation.snapshot()
                 self.simulation.step(dt)
+                self._update_bot_fall_resets(dt)
+                self._update_bot_race_state()
                 self._handle_running_state(previous_state, self.simulation.snapshot(), dt)
         self._animate_props(task.time, dt)
         self._update_ghost_playback(self.simulation.snapshot().time)
@@ -1774,7 +2517,7 @@ class MarbleRampApp(ShowBase):
         speed = state.speed
         for pulse in self.pulse_nodes:
             lift = 1.0 + pulse.amplitude * (0.5 + 0.5 * sin(time_s * pulse.speed + pulse.phase))
-            lift += self.boost_flash * 0.04 + self.finish_flash * 0.06
+            lift += self.boost_flash * 0.04 + self.finish_flash * 0.06 + self.start_burst * 0.10
             pulse.node.setColorScale(
                 min(1.08, pulse.base_color.x * lift),
                 min(1.08, pulse.base_color.y * lift),
@@ -1783,17 +2526,15 @@ class MarbleRampApp(ShowBase):
             )
 
         for index, line in enumerate(self.speed_lines):
-            speed_scale = 0.55 + min(0.26, speed * 0.02)
-            speed_scale += self.boost_flash * 0.08
-            alpha = min(0.20, 0.04 + speed * 0.012 + self.boost_flash * 0.05)
-            line.setScale(speed_scale, 1.0, 1.0)
-            line.setColor(0.78, 0.82, 0.88, alpha)
+            speed_scale = 0.62 + min(0.52, speed * 0.040)
+            speed_scale += self.boost_flash * 0.14 + self.start_burst * 0.36
+            alpha = min(0.56, 0.08 + speed * 0.020 + self.boost_flash * 0.08 + self.start_burst * 0.14)
+            line.setScale(speed_scale * (1.0 + index * 0.12), 1.0, 1.0)
+            line.setColor(0.78, 0.82 + 0.04 * index, 0.88 + 0.05 * index, alpha * (1.0 - index * 0.18))
 
         for pad in self.boost_pads:
             pulse_scale = 1.0 + pad.pulse * 0.10
             ambient_scale = 0.92
-            if pad.spent:
-                ambient_scale *= 0.78
             pad.root.setScale(pulse_scale)
             pad.root.setColorScale(
                 ambient_scale + pad.pulse * 0.16,
@@ -1809,10 +2550,51 @@ class MarbleRampApp(ShowBase):
                 1.0,
             )
 
+        remaining_confetti: list[ConfettiPiece] = []
+        for piece in self.finish_confetti:
+            piece.age += dt
+            if piece.age >= piece.lifetime or piece.node.isEmpty():
+                if not piece.node.isEmpty():
+                    piece.node.removeNode()
+                continue
+            piece.velocity.z -= 8.8 * dt
+            piece.node.setPos(piece.node.getPos() + piece.velocity * dt)
+            piece.node.setHpr(piece.node.getHpr() + piece.spin_hpr * dt)
+            alpha = max(0.0, 1.0 - piece.age / piece.lifetime)
+            piece.node.setColorScale(1.0, 1.0, 1.0, alpha)
+            remaining_confetti.append(piece)
+        self.finish_confetti = remaining_confetti
+        self._animate_moving_obstacles(state.time)
+
+    def _animate_moving_obstacles(self, time_s: float) -> None:
+        for visual in self.moving_obstacle_visuals:
+            if visual.root.isEmpty():
+                continue
+            segment = ramp_segment_at_distance(self.sim_config, visual.obstacle.distance_along_ramp)
+            if visual.obstacle.motion_kind == "pendulum":
+                surface = ramp_surface_point(self.sim_config, visual.obstacle.distance_along_ramp)
+                side = ramp_side(self.sim_config, visual.obstacle.distance_along_ramp)
+                normal = ramp_normal(self.sim_config, visual.obstacle.distance_along_ramp)
+                pivot_height = visual.obstacle.pivot_height if visual.obstacle.pivot_height > 0.0 else 1.05
+                phase = visual.obstacle.motion_phase + time_s * visual.obstacle.motion_speed
+                swing_angle = sin(phase) * visual.obstacle.motion_amplitude
+                visual.root.setPos(surface + side * visual.obstacle.lateral_offset + normal * pivot_height)
+                visual.root.setHpr(segment.heading_deg, segment.bank_deg, self.sim_config.angle_deg)
+                if visual.arm is not None and not visual.arm.isEmpty():
+                    visual.arm.setHpr(0.0, degrees(swing_angle), 0.0)
+            else:
+                center, heading_deg = obstacle_pose(self.sim_config, visual.obstacle, time_s)
+                visual.root.setPos(center)
+                visual.root.setHpr(segment.heading_deg + heading_deg, segment.bank_deg, self.sim_config.angle_deg)
+            if visual.marker is not None and visual.obstacle.motion_kind == "sweeper":
+                phase = visual.obstacle.motion_phase + time_s * visual.obstacle.motion_speed
+                visual.marker.setColorScale(1.0, 1.0, 1.0, 0.84 + 0.16 * sin(phase))
+
     def _apply_state(self, dt: float | None = None) -> None:
         state = self.simulation.snapshot()
         self.marble_root.setPos(state.position)
         self.marble_root.setQuat(self.simulation.marble_np.getQuat())
+        self._update_bot_visuals()
         camera_dt = 1.0 / 60.0 if dt is None else min(max(dt, 0.0), 1.0 / 30.0)
         self._update_camera(state, camera_dt)
         progress = min(100.0, (state.path_distance / self.sim_config.length) * 100.0)
@@ -1821,7 +2603,7 @@ class MarbleRampApp(ShowBase):
         self.title.setText(self.current_level.name)
         subtitle = self.current_level.description or f"{self.current_level.difficulty.title()} {self.current_level.theme.title()} course."
         if self.race_phase == "menu":
-            subtitle = "Playable demo build. Select a track and start."
+            subtitle = self._mode_description(self.selected_mode)
         self.subtitle.setText(subtitle)
         self.hud.setText(
             (
@@ -1838,15 +2620,22 @@ class MarbleRampApp(ShowBase):
             )
         else:
             medal_text = ""
+        if self.active_mode == self.MODE_BOT_RACE and self.race_phase not in {"menu"}:
+            medal_text = self._format_bot_leaderboard(state.path_distance)
         self.status.setText(medal_text)
         if self.finish_grade is not None and self.finish_time is not None:
-            self.result.setText(
-                (
-                    f"run    {format_seconds(self.finish_time)}\n"
-                    f"best   {best_text}\n"
+            result_text = (
+                f"run    {format_seconds(self.finish_time)}\n"
+                f"best   {best_text}\n"
+                f"medal  {self.finish_grade.medal}"
+            )
+            if self.active_mode == self.MODE_BOT_RACE and self.last_finish_place is not None:
+                result_text = (
+                    f"place  P{self.last_finish_place}/{len(self.bot_marbles) + 1}\n"
+                    f"time   {format_seconds(self.finish_time)}\n"
                     f"medal  {self.finish_grade.medal}"
                 )
-            )
+            self.result.setText(result_text)
             self.result.setFg((self.finish_grade.color[0], self.finish_grade.color[1], self.finish_grade.color[2], 1.0))
         else:
             self.result.setText("")
@@ -1856,11 +2645,11 @@ class MarbleRampApp(ShowBase):
         if self.race_phase == "menu":
             selected = self.levels[self.selected_level_index]
             selected_unlocked = self._is_level_unlocked(self.selected_level_index)
-            center_text = selected.level.name
+            center_text = self._mode_label(self.selected_mode)
             lock_text = "" if selected_unlocked else "LOCKED   "
             center_subtitle = (
-                f"{lock_text}{selected.level.difficulty.title()} / {selected.level.theme.title()}   "
-                f"Best {format_seconds(self.progress.levels.get(selected.key).best_time) if self.progress.levels.get(selected.key) and self.progress.levels.get(selected.key).best_time is not None else '--'}"
+                f"{lock_text}{selected.level.name}   "
+                f"{selected.level.difficulty.title()} / {selected.level.theme.title()}"
             )
         if self.paused and self.race_phase == "running":
             center_text = "PAUSED"
@@ -1873,23 +2662,31 @@ class MarbleRampApp(ShowBase):
         self.center_message.setFg((self.event_color.x, self.event_color.y, self.event_color.z, 1.0))
         self.banner.setFg((self.event_color.x * 0.88, self.event_color.y * 0.92, self.event_color.z, 1.0))
         if self.race_phase == "menu":
-            lines = []
-            for index, runtime in enumerate(self.levels):
-                marker = ">" if index == self.selected_level_index else " "
-                unlocked = self._is_level_unlocked(index)
-                progress_entry = self.progress.levels.get(runtime.key)
-                medal = progress_entry.best_medal if progress_entry is not None else "NONE"
-                lines.append(f"{marker} {runtime.level.name}   {'OPEN' if unlocked else 'LOCKED'}   {medal}")
-            self.progress_caption.setText("\n".join(lines))
+            selected = self.levels[self.selected_level_index]
+            progress_entry = self.progress.levels.get(selected.key)
+            best_time = format_seconds(progress_entry.best_time) if progress_entry is not None and progress_entry.best_time is not None else "--"
+            self.progress_caption.setText(
+                f"Mode: {self._mode_label(self.selected_mode)}   Track: {selected.level.name}   Best: {best_time}"
+            )
         elif self.race_phase in {"finished", "failed"}:
             action_text = "Space retry   M menu"
             if self.level_index + 1 < len(self.levels) and self._is_level_unlocked(min(self.level_index + 1, len(self.levels) - 1)):
                 action_text += "   Enter retry"
             self.progress_caption.setText(action_text)
         else:
-            self.progress_caption.setText(f"{self.current_section_name}   {self.current_section_focus}")
+            section_text = f"{self.current_section_name}   {self.current_section_focus}"
+            if self.active_mode == self.MODE_BOT_RACE and self.bot_marbles:
+                racers = self._race_standings(state.path_distance)
+                place = next(index for index, racer in enumerate(racers, start=1) if racer[0] == "YOU")
+                leader_name = racers[0][0]
+                section_text = f"P{place}/{len(racers)}   Leader {leader_name}   {self.current_section_name}"
+            self.progress_caption.setText(section_text)
         self.progress_fill.setScale(max(0.001, progress / 100.0), 1.0, 1.0)
         self.progress_fill.setColor(0.82, 0.84, 0.88, 0.95)
+        if self.race_phase == "menu":
+            self.controls.setText("Up/Down mode   Left/Right track   Enter start   R reset   Esc quit")
+        else:
+            self.controls.setText("Left/Right steer   Down brake   Space pause   M menu   R restart   Esc quit")
         if self.debug_overlay_visible:
             self.debug_text.setText(
                 (
@@ -1904,8 +2701,10 @@ class MarbleRampApp(ShowBase):
         else:
             self.debug_text.setText("")
 
-        flash_alpha = max(self.flash_alpha, self.boost_flash * 0.10, self.finish_flash * 0.16)
+        flash_alpha = max(self.flash_alpha, self.boost_flash * 0.10, self.finish_flash * 0.16, self.start_burst * 0.18)
         flash_color = Vec4(self.flash_color)
+        if self.start_burst * 0.18 >= flash_alpha - 1e-6:
+            flash_color = Vec4(0.24, 0.86, 0.98, flash_alpha)
         if self.boost_flash * 0.10 >= flash_alpha - 1e-6:
             flash_color = Vec4(0.18, 0.82, 0.96, flash_alpha)
         if self.finish_flash * 0.16 >= flash_alpha - 1e-6 and self.finish_grade is not None:
@@ -2146,7 +2945,7 @@ class MarbleRampApp(ShowBase):
 
         self.camera.setPos(camera_pos)
         self.camera.lookAt(self.camera_look_target)
-        target_roll = -self.steering_input * min(4.0, state.speed * 1.2) * (1.0 - 0.35 * self.camera_collision_blend)
+        target_roll = -self.steering_input * min(6.4, state.speed * 1.55) * (1.0 - 0.35 * self.camera_collision_blend)
         self.camera_roll = smooth_value(self.camera_roll, target_roll, self.camera_roll_lag, dt)
         self.camera.setR(self.camera_roll)
-        self.camLens.setFov(48.0 + min(3.5, state.speed * 0.55))
+        self.camLens.setFov(52.0 + min(10.0, state.speed * 1.10) + self.boost_flash * 4.0 + self.start_burst * 3.0)

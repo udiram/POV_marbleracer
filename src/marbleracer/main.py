@@ -31,24 +31,16 @@ def main() -> None:
         help="Bypass the track-select menu and launch directly into the selected level.",
     )
     parser.add_argument(
+        "--mode",
+        choices=("time_trial", "bot_race"),
+        default=None,
+        help="Launch directly into a specific gameplay mode.",
+    )
+    parser.add_argument(
         "--reset-progress",
         action="store_true",
         help="Clear the local progression save before launching.",
     )
-    parser.add_argument(
-        "--train-viz",
-        action="store_true",
-        help="Launch the population training visualizer instead of the single-marble game.",
-    )
-    parser.add_argument("--population-size", type=int, default=18, help="Population size for training visualization.")
-    parser.add_argument("--elite-count", type=int, default=4, help="Elite survivors for each training generation.")
-    parser.add_argument("--generations", type=int, default=8, help="Number of visualized generations to run.")
-    parser.add_argument("--training-seed", type=int, default=0, help="Random seed for the training population.")
-    parser.add_argument("--steps-per-frame", type=int, default=4, help="Simulation steps to advance per rendered frame in training mode.")
-    parser.add_argument("--output-dir", type=str, default=None, help="Artifact output directory for training visualization.")
-    parser.add_argument("--capture-frames", action="store_true", help="Save each rendered training frame to disk.")
-    parser.add_argument("--compile-video", action="store_true", help="Compile captured training frames into an MP4 with ffmpeg.")
-    parser.add_argument("--auto-close", action="store_true", help="Close automatically after the visual training run completes.")
     parser.add_argument(
         "--obstacle-count",
         type=int,
@@ -86,33 +78,14 @@ def main() -> None:
             obstacle_count=args.obstacle_count,
             course_seed=args.course_seed,
         )
-    if args.train_viz:
-        from pathlib import Path
-
-        from .training_viz import MarbleTrainingVizApp, TrainingVizConfig
-
-        MarbleTrainingVizApp(
-            config,
-            TrainingVizConfig(
-                population_size=args.population_size,
-                elite_count=args.elite_count,
-                generations=args.generations,
-                seed=args.training_seed,
-                steps_per_frame=args.steps_per_frame,
-                output_dir=Path(args.output_dir) if args.output_dir else None,
-                capture_frames=args.capture_frames,
-                compile_video=args.compile_video,
-                auto_close=args.auto_close,
-            ),
-        ).run()
-        return
     from .app import MarbleRampApp
 
     MarbleRampApp(
         config if not loaded_levels else None,
         levels=loaded_levels if loaded_levels else None,
         initial_level=args.level,
-        menu_disabled=args.menu_disabled and args.level is not None,
+        menu_disabled=(args.menu_disabled and args.level is not None) or args.mode is not None,
+        start_mode=args.mode,
     ).run()
 
 
