@@ -37,6 +37,16 @@ from .gameplay import (
     grade_run,
     rate_section,
 )
+from .bot_controller import (
+    BotController,
+    BotSensorFrame,
+    ExportedBotPolicy,
+    apply_bot_control,
+    boost_pad_at_position,
+    build_bot_observation,
+    make_bot_controller,
+    monotonic_progress,
+)
 from .levels import TrackLevel, level_from_config, level_to_config, list_levels
 from .physics import (
     GuideObstacle,
@@ -174,6 +184,7 @@ class BotMarble:
     body_np: NodePath
     body: BulletRigidBodyNode
     visual_root: NodePath
+    controller: BotController
     lane_offset: float
     speed_bias: float
     progress: float = 0.0
@@ -218,6 +229,7 @@ class MarbleRampApp(ShowBase):
         initial_level: str | None = None,
         menu_disabled: bool = False,
         start_mode: str | None = None,
+        bot_controller_mode: str = "mixed",
     ) -> None:
         super().__init__()
         loaded_levels = tuple(levels or list_levels())
@@ -246,6 +258,10 @@ class MarbleRampApp(ShowBase):
         self.sim_config = self.level_runtime.config if config is None else config
         self.simulation = MarbleRampSimulation(self.sim_config)
         self.simulation.settle_start_contact()
+        self.bot_controller_mode = (
+            bot_controller_mode if bot_controller_mode in {"heuristic", "learned", "mixed"} else "mixed"
+        )
+        self.learned_bot_policy = ExportedBotPolicy.load()
         self.menu_disabled = menu_disabled
         self.enable_fancy_rendering = os.environ.get("MARBLERACER_FANCY_RENDERING", "").strip() == "1"
         self.paused = False
@@ -1467,6 +1483,13 @@ class MarbleRampApp(ShowBase):
                     body_np=body_np,
                     body=body,
                     visual_root=visual_root,
+                    controller=make_bot_controller(
+                        self.bot_controller_mode,
+                        level_key=self.current_level_key,
+                        bot_index=index,
+                        config=self.sim_config,
+                        policy=self.learned_bot_policy,
+                    ),
                     lane_offset=lane_offset,
                     speed_bias=speed_bias,
                 )
@@ -1494,6 +1517,7 @@ class MarbleRampApp(ShowBase):
         bot.previous_progress = spawn_distance
         bot.active_boost_pad_index = None
         bot.last_boost_pad_index = None
+        bot.controller.reset()
 
     def _reset_bot_marbles(self) -> None:
         spawn_distances = (0.0, 0.0)
@@ -1510,6 +1534,12 @@ class MarbleRampApp(ShowBase):
         if matching_lanes:
             return min(matching_lanes, key=lambda lane_offset: abs(lane_offset - preferred_offset))
         return min(lane_offsets, key=lambda lane_offset: abs(lane_offset - preferred_offset))
+
+    def _bot_is_airborne(self, position: Vec3, progress: float, total_contacts: int) -> bool:
+        surface_point = ramp_surface_point(self.sim_config, progress)
+        normal = ramp_normal(self.sim_config, progress)
+        normal_gap = (position - surface_point).dot(normal) - self.sim_config.marble_radius
+        return normal_gap > 0.06 and total_contacts == 0
 
     def _settle_start_grid(self, *, settle_steps: int = 24, dt: float = 1.0 / 960.0) -> None:
         if settle_steps <= 0 or dt <= 0.0:
@@ -1530,51 +1560,49 @@ class MarbleRampApp(ShowBase):
     def _update_bot_controllers(self, dt: float) -> None:
         if self.active_mode != self.MODE_BOT_RACE:
             return
-        mass = self.sim_config.marble_mass
         for bot in self.bot_marbles:
             if bot.finish_time is not None:
                 continue
             position = bot.body_np.getPos()
             bot.previous_position = Vec3(position)
             bot.previous_progress = bot.progress
-            near_progress = path_distance_for_position_near(self.sim_config, position, bot.progress)
-            absolute_progress = path_distance_for_position(self.sim_config, position)
-            progress_candidate = near_progress
-            if abs(absolute_progress - near_progress) <= 4.0:
-                progress_candidate = max(progress_candidate, absolute_progress)
-            bot.progress = max(bot.progress, progress_candidate)
+            bot.progress = monotonic_progress(self.sim_config, position, bot.progress)
             velocity = bot.body.getLinearVelocity()
-            lookahead_distance = min(self.sim_config.length, bot.progress + 1.4)
-            target_tangent = ramp_tangent(self.sim_config, lookahead_distance)
-            if target_tangent.length_squared() <= 1e-9:
-                continue
-            target_tangent.normalize()
-            target_side = ramp_side(self.sim_config, lookahead_distance)
-            target_normal = ramp_normal(self.sim_config, lookahead_distance)
-            target_lane_offset = self._bot_lane_target_offset(lookahead_distance, bot.lane_offset)
-            target_point = (
-                ramp_surface_point(self.sim_config, lookahead_distance)
-                + target_side * target_lane_offset
-                + target_normal * (self.sim_config.marble_radius + 0.01)
+            total_contacts = self.simulation.world.contactTest(bot.body).getNumContacts()
+            airborne = self._bot_is_airborne(position, bot.progress, total_contacts)
+            observation = build_bot_observation(
+                self.sim_config,
+                BotSensorFrame(
+                    position=position,
+                    linear_velocity=velocity,
+                    progress=bot.progress,
+                    time_s=self.simulation.time,
+                    airborne=airborne,
+                    total_contacts=total_contacts,
+                    active_boost_pad_index=bot.active_boost_pad_index,
+                    preferred_lane_offset=bot.lane_offset,
+                    speed_bias=bot.speed_bias,
+                ),
             )
-            relative = target_point - position
-            forward_speed = velocity.dot(target_tangent)
-            lateral_speed = velocity.dot(target_side)
-            vertical_speed = velocity.dot(target_normal)
-            target_speed = 6.2 + bot.speed_bias + min(2.6, bot.progress / max(self.sim_config.length, 1e-6) * 2.8)
-            forward_force = max(0.0, target_speed - forward_speed) * mass * 4.0
-            lateral_force = (relative.dot(target_side) * 7.4 - lateral_speed * 2.2) * mass
-            bot.body.applyCentralForce(target_tangent * forward_force + target_side * lateral_force)
-            active_boost = self._boost_pad_at_position(position, airborne=False)
-            bot.active_boost_pad_index = active_boost[0] if active_boost is not None else None
-            if active_boost is not None:
-                pad_index, boost_pad = active_boost
-                bot.body.setLinearVelocity(velocity + target_tangent * (boost_pad.acceleration * dt))
-                if pad_index != bot.last_boost_pad_index and pad_index < len(self.boost_pads):
-                    self._pulse_boost_pad(self.boost_pads[pad_index])
+            plan = bot.controller.plan_control(observation)
+            applied = apply_bot_control(
+                self.sim_config,
+                bot.body,
+                position,
+                velocity,
+                bot.progress,
+                plan,
+                dt,
+                airborne=airborne,
+            )
+            bot.active_boost_pad_index = applied.active_boost_pad_index
+            if (
+                bot.active_boost_pad_index is not None
+                and bot.active_boost_pad_index != bot.last_boost_pad_index
+                and bot.active_boost_pad_index < len(self.boost_pads)
+            ):
+                self._pulse_boost_pad(self.boost_pads[bot.active_boost_pad_index])
             bot.last_boost_pad_index = bot.active_boost_pad_index
-            if relative.dot(target_normal) < -0.02 or vertical_speed > 0.55:
-                bot.body.applyCentralForce(-target_normal * mass * 2.2)
 
     def _update_bot_race_state(self) -> None:
         if self.active_mode != self.MODE_BOT_RACE:
@@ -1583,12 +1611,7 @@ class MarbleRampApp(ShowBase):
             if bot.finish_time is not None:
                 continue
             position = bot.body_np.getPos()
-            absolute_progress = path_distance_for_position(self.sim_config, position)
-            bot.progress = max(
-                bot.progress,
-                absolute_progress,
-                path_distance_for_position_near(self.sim_config, position, bot.progress),
-            )
+            bot.progress = monotonic_progress(self.sim_config, position, bot.progress)
             if bot.previous_position is not None:
                 previous_state = type("BotState", (), {})()
                 previous_state.position = bot.previous_position
@@ -2075,29 +2098,7 @@ class MarbleRampApp(ShowBase):
         )
 
     def _boost_pad_at_position(self, position: Vec3, *, airborne: bool = False) -> tuple[int, object] | None:
-        activation_margin = self.sim_config.marble_radius
-        for index, boost_pad in enumerate(self.sim_config.boost_pads):
-            center = boost_pad_center_position(self.sim_config, boost_pad)
-            tangent = ramp_tangent(self.sim_config, boost_pad.distance_along_ramp)
-            if tangent.length_squared() <= 1e-9:
-                continue
-            tangent.normalize()
-            side = ramp_side(self.sim_config, boost_pad.distance_along_ramp)
-            normal = ramp_normal(self.sim_config, boost_pad.distance_along_ramp)
-            relative = position - center
-            longitudinal_offset = abs(relative.dot(tangent))
-            lateral_offset = abs(relative.dot(side))
-            normal_offset = relative.dot(normal)
-            if longitudinal_offset > boost_pad.length * 0.5 + activation_margin:
-                continue
-            if lateral_offset > boost_pad.width * 0.5 + activation_margin:
-                continue
-            if normal_offset < -0.12 or normal_offset > activation_margin * 1.8:
-                continue
-            if airborne and normal_offset > activation_margin * 0.8:
-                continue
-            return index, boost_pad
-        return None
+        return boost_pad_at_position(self.sim_config, position, airborne=airborne)
 
     def _track_relative_offsets(self, position: Vec3, reference_distance: float) -> tuple[float, float, float]:
         return shared_track_relative_offsets(self.sim_config, position, reference_distance)

@@ -1,0 +1,5 @@
+{
+  "level_key": "default-showcase",
+  "weights_file": "default_bot_policy_weights.npz",
+  "hidden_layer_count": 2
+}

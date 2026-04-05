@@ -42,6 +42,12 @@ def main() -> None:
         help="Clear the local progression save before launching.",
     )
     parser.add_argument(
+        "--bot-controller",
+        choices=("heuristic", "learned", "mixed"),
+        default="mixed",
+        help="Select the bot driver. 'mixed' uses a learned bot when a compatible policy artifact is available.",
+    )
+    parser.add_argument(
         "--obstacle-count",
         type=int,
         default=defaults.obstacle_count,
@@ -86,6 +92,7 @@ def main() -> None:
         initial_level=args.level,
         menu_disabled=(args.menu_disabled and args.level is not None) or args.mode is not None,
         start_mode=args.mode,
+        bot_controller_mode=args.bot_controller,
     ).run()
 
 

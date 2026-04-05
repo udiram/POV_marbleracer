@@ -1,3 +1,9 @@
+numpy>=2.0
 panda3d>=1.10
 panda3d-gltf>=1.3
 panda3d-simplepbr>=0.13
+
+[train]
+gymnasium>=1.2
+stable-baselines3>=2.8
+torch>=2.11

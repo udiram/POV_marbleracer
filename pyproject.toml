@@ -5,9 +5,17 @@ description = "Physically grounded Panda3D marble-on-ramp simulation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "numpy>=2.0",
   "panda3d>=1.10",
   "panda3d-gltf>=1.3",
   "panda3d-simplepbr>=0.13",
+]
+
+[project.optional-dependencies]
+train = [
+  "gymnasium>=1.2",
+  "stable-baselines3>=2.8",
+  "torch>=2.11",
 ]
 
 [project.scripts]
@@ -23,3 +31,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+marbleracer = ["data/*.json", "data/*.npz", "data/*.md"]
