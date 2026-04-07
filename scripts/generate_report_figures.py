@@ -801,6 +801,7 @@ def generate_asset_renders(config: SimulationConfig, output_dir: Path) -> list[P
         AmbientLight,
         CardMaker,
         DirectionalLight,
+        LineSegs,
         NodePath,
         PNMImage,
         PointLight,
@@ -895,14 +896,24 @@ def generate_asset_renders(config: SimulationConfig, output_dir: Path) -> list[P
         floor_scale: float = 1.2,
         fit_mode: str = "balanced",
         color_boost: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        focus_nodes: list[NodePath] | None = None,
+        focus_color_boost: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        context_color_boost: tuple[float, float, float] = (1.0, 1.0, 1.0),
     ) -> Path:
         app.scene_root.hide()
         studio = app.render.attachNewNode("asset-studio")
         studio.setLightOff(1)
+        focus_ids = {int(node.this) for node in (focus_nodes or [])}
         copied: list[NodePath] = []
         for node in unique_nodes(nodes):
             copied_node = node.copyTo(studio)
-            copied_node.setColorScale(color_boost[0], color_boost[1], color_boost[2], 1.0)
+            boost = focus_color_boost if int(node.this) in focus_ids else context_color_boost
+            copied_node.setColorScale(
+                color_boost[0] * boost[0],
+                color_boost[1] * boost[1],
+                color_boost[2] * boost[2],
+                1.0,
+            )
             copied.append(copied_node)
 
         min_point, max_point = studio.getTightBounds()
@@ -932,7 +943,7 @@ def generate_asset_renders(config: SimulationConfig, output_dir: Path) -> list[P
         back_size = max(extent.x, extent.z, 1.8) * 2.6
         cm.setFrame(-back_size * 0.5, back_size * 0.5, -back_size * 0.5, back_size * 0.5)
         back_card = backdrop.attachNewNode(cm.generate())
-        back_card.setColor(0.84, 0.90, 0.97, 1.0)
+        back_card.setColor(0.89, 0.93, 0.98, 1.0)
 
         look = Vec3(0.0, 0.0, extent.z * 0.08)
         view_dir = Vec3(*direction)
@@ -976,6 +987,90 @@ def generate_asset_renders(config: SimulationConfig, output_dir: Path) -> list[P
         studio.removeNode()
         app.scene_root.show()
         return out_path
+
+    def stage_obstacle_pose(obstacle) -> None:
+        if obstacle.motion_kind == "pendulum":
+            target_angle = math.pi * 0.5
+        elif obstacle.motion_kind == "sweeper":
+            target_angle = math.pi * 0.2
+        else:
+            return
+        if obstacle.motion_speed <= 0.0:
+            return
+        sample_time = (target_angle - obstacle.motion_phase) / obstacle.motion_speed
+        app._animate_moving_obstacles(max(0.0, sample_time))
+
+    def add_motion_hint(root: NodePath, obstacle) -> NodePath | None:
+        hint = root.attachNewNode("motion-hint")
+        hint.setLightOff(1)
+        hint.setDepthWrite(False)
+        hint.setDepthTest(False)
+        hint.setBin("fixed", 20)
+
+        line = LineSegs("motion-hint-line")
+        line.setThickness(5.0)
+
+        if obstacle.motion_kind == "pendulum":
+            pivot_height = obstacle.pivot_height if obstacle.pivot_height > 0.0 else 1.05
+            rod_length = max(obstacle.height * 0.5 + 0.16, pivot_height - obstacle.height * 0.5)
+            radius = max(rod_length * 0.46, 0.18)
+            center = Vec3(0.0, 0.0, -radius * 0.08)
+            sweep = max(obstacle.motion_amplitude * 1.35, 0.24)
+            samples = 25
+            for index in range(samples):
+                frac = index / (samples - 1)
+                angle = -sweep + (2.0 * sweep * frac)
+                point = Vec3(math.sin(angle) * radius, 0.0, -math.cos(angle) * radius) + center
+                line.setColor(0.98, 0.98, 1.0, 0.92 if 0 < index < samples - 1 else 0.0)
+                if index == 0:
+                    line.moveTo(point)
+                else:
+                    line.drawTo(point)
+
+            arrow = LineSegs("motion-hint-arrow")
+            arrow.setThickness(5.0)
+            arrow.setColor(0.98, 0.98, 1.0, 0.95)
+            tip_angle = sweep
+            tip = Vec3(math.sin(tip_angle) * radius, 0.0, -math.cos(tip_angle) * radius) + center
+            left = tip + Vec3(-0.06, 0.0, -0.02)
+            right = tip + Vec3(-0.02, 0.0, -0.06)
+            arrow.moveTo(left)
+            arrow.drawTo(tip)
+            arrow.drawTo(right)
+            arrow_np = hint.attachNewNode(arrow.create())
+            arrow_np.setPos(0.0, obstacle.width * 0.95, -rod_length * 0.12)
+            arrow_np.setHpr(0.0, 0.0, 0.0)
+
+            line_np = hint.attachNewNode(line.create())
+            line_np.setPos(0.0, obstacle.width * 0.95, -rod_length * 0.12)
+            return hint
+
+        if obstacle.motion_kind == "sweeper":
+            span = max(obstacle.motion_amplitude * 2.2, 0.26)
+            z = obstacle.height * 1.15
+            start = Vec3(-span, 0.0, z)
+            end = Vec3(span, 0.0, z)
+            line.setColor(0.98, 0.98, 1.0, 0.92)
+            line.moveTo(start)
+            line.drawTo(end)
+            line_np = hint.attachNewNode(line.create())
+
+            arrow = LineSegs("motion-hint-arrow")
+            arrow.setThickness(5.0)
+            arrow.setColor(0.98, 0.98, 1.0, 0.95)
+            arrow.moveTo(Vec3(span - 0.07, 0.0, z + 0.04))
+            arrow.drawTo(end)
+            arrow.drawTo(Vec3(span - 0.07, 0.0, z - 0.04))
+            arrow.moveTo(Vec3(-span + 0.07, 0.0, z + 0.04))
+            arrow.drawTo(start)
+            arrow.drawTo(Vec3(-span + 0.07, 0.0, z - 0.04))
+            arrow_np = hint.attachNewNode(arrow.create())
+            line_np.setPos(0.0, 0.0, 0.0)
+            arrow_np.setPos(0.0, 0.0, 0.0)
+            return hint
+
+        hint.removeNode()
+        return None
 
     def build_asset_sheet(output_dir: Path, entries: list[tuple[str, str]]) -> Path:
         width, height = 1400, 1280
@@ -1073,39 +1168,58 @@ def generate_asset_renders(config: SimulationConfig, output_dir: Path) -> list[P
     generated.append(
         render_asset(
             app,
-            nearby_track_context(app.scene_root, distance_x=block_root.getPos().x, radius=3.0) + [block_root],
+            [block_root],
             output_dir / "asset_block_obstacle.png",
-            direction=(1.7, -2.3, 1.15),
-            fov=24.0,
-            pad=1.55,
+            direction=(1.05, -1.25, 0.92),
+            fov=22.0,
+            pad=1.18,
             fit_mode="close",
             color_boost=(1.10, 1.12, 1.16),
+            focus_nodes=[block_root],
+            focus_color_boost=(1.60, 1.48, 1.28),
+            context_color_boost=(0.76, 0.82, 0.92),
         )
     )
+    stage_obstacle_pose(next(obstacle for obstacle, root in obstacle_pairs if root == pendulum_root))
+    pendulum_obstacle = next(obstacle for obstacle, root in obstacle_pairs if root == pendulum_root)
+    pendulum_hint = add_motion_hint(pendulum_root, pendulum_obstacle)
     generated.append(
         render_asset(
             app,
-            nearby_track_context(app.scene_root, distance_x=pendulum_root.getPos().x, radius=3.2) + [pendulum_root],
+            [pendulum_root],
             output_dir / "asset_pendulum_obstacle.png",
-            direction=(1.8, -2.1, 1.25),
-            fov=24.0,
-            pad=1.55,
+            direction=(0.84, -1.02, 1.18),
+            fov=22.0,
+            pad=1.18,
             fit_mode="close",
             color_boost=(1.10, 1.12, 1.16),
+            focus_nodes=[pendulum_root],
+            focus_color_boost=(1.58, 1.46, 1.24),
+            context_color_boost=(0.74, 0.80, 0.92),
         )
     )
+    if pendulum_hint is not None and not pendulum_hint.isEmpty():
+        pendulum_hint.removeNode()
+    sweeper_obstacle = next(obstacle for obstacle, root in obstacle_pairs if root == sweeper_root)
+    stage_obstacle_pose(sweeper_obstacle)
+    sweeper_hint = add_motion_hint(sweeper_root, sweeper_obstacle)
     generated.append(
         render_asset(
             app,
-            nearby_track_context(app.scene_root, distance_x=sweeper_root.getPos().x, radius=3.2) + [sweeper_root],
+            [sweeper_root],
             output_dir / "asset_sweeper_obstacle.png",
-            direction=(1.8, -2.2, 1.15),
-            fov=24.0,
-            pad=1.55,
+            direction=(0.96, -1.10, 1.02),
+            fov=22.0,
+            pad=1.18,
             fit_mode="close",
             color_boost=(1.10, 1.12, 1.16),
+            focus_nodes=[sweeper_root],
+            focus_color_boost=(1.36, 1.60, 1.48),
+            context_color_boost=(0.74, 0.80, 0.90),
         )
     )
+    if sweeper_hint is not None and not sweeper_hint.isEmpty():
+        sweeper_hint.removeNode()
     generated.append(
         render_asset(
             app,
