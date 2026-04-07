@@ -11,6 +11,7 @@ src/marbleracer/physics.py
 src/marbleracer/progress.py
 src/marbleracer/race_rules.py
 src/marbleracer/rl_env.py
+src/marbleracer/training_monitor.py
 src/marbleracer/data/README.md
 src/marbleracer/data/default_bot_policy_manifest.json
 src/marbleracer/data/default_bot_policy_weights.npz
@@ -27,3 +28,4 @@ tests/test_levels.py
 tests/test_physics.py
 tests/test_progress.py
 tests/test_rl_env.py
+tests/test_training_monitor.py
