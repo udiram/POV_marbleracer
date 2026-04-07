@@ -1,47 +1,107 @@
-# 2VG3 Project README
+# POV Marbleracer
 
-## Exercise 1: Game Demo Overview
+Panda3D + Bullet marble racing project with a playable downhill course, authored obstacles, time-trial ghosts, bot racing, training utilities, and report-generation scripts.
 
-This project is a Panda3D + Bullet physics marble racing demo. The player controls a marble rolling down a banked track, avoids falling off, uses boost pads to gain speed, and tries to reach the finish line as quickly as possible.
+## Overview
 
-The core demo is a single-player physics race:
+This repository contains three main pieces:
 
-- `Time Trial`: race the track and try to set the best time, with ghost replay from the saved best run.
-- `Bot Race`: race against other physical marbles in the same world.
+- A playable marble racing game in `src/marbleracer` with `Time Trial` and `Bot Race` modes.
+- Content and tooling for levels, figure generation, training runs, and evaluation in `levels/`, `scripts/`, `figures/`, and `artifacts/`.
+- Project documentation and outputs, including the bundled report PDF.
 
-The main achievement condition is reaching the finish line. When the player finishes, the game shows a clear success message, time, medal, and in bot race a placing result.
+Core gameplay features:
 
-## Running the Demo
+- banked downhill track physics using Panda3D + Bullet
+- boost pads, rails, static and moving obstacles
+- ghost replay for best time-trial runs
+- bot marbles and RL/training support
+- report and figure generation scripts for the project writeup
 
-From the repo root:
+## Repo Layout
+
+Important paths:
+
+- `src/marbleracer/`: main application, physics, gameplay rules, builder, bot controller, and training environment
+- `levels/`: authored level JSON files
+- `scripts/`: figure generation, training, evaluation, monitoring, and report helper scripts
+- `figures/`: generated figures and exported visual assets
+- `artifacts/`: training logs, monitor outputs, and snapshots
+- `tests/`: unit tests
+- `Development_of_a_marble_racing_simulator.pdf`: project report
+
+Useful entry points:
+
+- `src/marbleracer/main.py`: game launcher
+- `src/marbleracer/builder.py`: level/builder tooling
+- `scripts/generate_report_figures.py`: regenerate the figure assets used in the report
+
+## Getting Started
+
+The project targets Python `3.11+`.
+
+Create a virtual environment and install dependencies:
 
 ```bash
-./.venv/bin/python -m marbleracer.main
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install -e .
 ```
 
-If the package is installed in editable mode:
+Run the game:
 
 ```bash
 marbleracer
 ```
 
-Useful commands:
+Or directly:
+
+```bash
+python -m marbleracer.main
+```
+
+List available levels:
 
 ```bash
 marbleracer --list-levels
-marbleracer --level default
+```
+
+Start a specific mode:
+
+```bash
 marbleracer --level default --mode time_trial
 marbleracer --level default --mode bot_race
+```
+
+Reset saved progress:
+
+```bash
 marbleracer --reset-progress
 ```
 
-## Exercise 2: How To Play and Goal
+## Development
 
-### Controls
+Run tests:
 
-- `Up/Down`: change mode in the menu
-- `Left/Right`: change track in the menu
-- `Enter` or `Space`: start / confirm
+```bash
+pytest
+```
+
+Regenerate report figures:
+
+```bash
+python scripts/generate_report_figures.py
+```
+
+Some scripts in `scripts/` are for RL training and analysis. Those use the packages already listed in `requirements.txt`, including PyTorch, Gymnasium, Stable-Baselines3, pandas, matplotlib, Pillow, and ReportLab.
+
+## Controls
+
+- `Up/Down`: change menu mode
+- `Left/Right`: change selected track in menus
+- `Enter` or `Space`: confirm/start
 - `Left/Right`: steer while racing
 - `Down`: brake
 - `Space`: pause
@@ -49,106 +109,15 @@ marbleracer --reset-progress
 - `M`: return to menu
 - `Esc`: quit
 
-### Goal
+## Report
 
-The goal is to stay on the track, keep speed through the corners, use boost pads effectively, and cross the finish line.
+Open the bundled report here:
 
-In `Time Trial`, the objective is to get the fastest clean run.
+- [Development_of_a_marble_racing_simulator.pdf](./Development_of_a_marble_racing_simulator.pdf)
 
-In `Bot Race`, the objective is to finish ahead of the other marbles.
+Embedded preview:
 
-## Exercise 3: Key Physics Used In The Demo
-
-The game uses Bullet rigid-body physics through Panda3D. The important physics choices are:
-
-- The player marble and bot marbles are Bullet sphere rigid bodies.
-- Gravity is applied through the Bullet world, so the marble gains speed naturally by rolling downhill.
-- Track banking changes how gravity resolves across the surface, which affects cornering and stability.
-- Friction and restitution are tuned so the marble rolls and collides in a controlled way rather than bouncing unrealistically.
-- Steering is implemented as a lateral force, not a teleport or direct position edit.
-- Braking is implemented as velocity damping, so it slows the marble instead of stopping instantly.
-- Boost pads add forward velocity along the local ramp tangent.
-- Rails, obstacles, and other marbles are all physical collision objects inside the same Bullet world.
-
-Important tuning choices in the current build:
-
-- low restitution to avoid pinball-like bounce
-- moderate friction so the marble still feels responsive
-- softer braking than a full stop
-- forgiving finish detection and off-track handling near the end of the course
-
-## Exercise 4: Novel Mechanics
-
-The main mechanics that make this demo more than just “a ball on a slope” are:
-
-- Boost pads that add speed in the local forward direction of the track
-- Banked turns that reward carrying speed and choosing better lines
-- Ghost replay in `Time Trial`, which lets the player race against their own best run
-- A mode-based structure where the same course supports solo racing and physical multi-marble racing
-- A forgiving arcade-style launch sequence to make the start feel more exciting than just releasing a ball
-
-The strongest original part of the project is the combination of marble-ramp physics with race-game feedback, rather than treating it as a pure simulation.
-
-## Exercise 5: How This Could Become A Full Game
-
-This demo could be expanded into a full arcade racing game.
-
-### Likely Game Category
-
-- arcade racing game
-- time-trial score attack game
-- possibly a local competitive party game
-
-### Components Still Needed
-
-- more polished track set and better difficulty progression
-- more consistent UI and menus
-- sound effects and music
-- better visual art direction and environment assets
-- cleaner race rules and more balancing between solo and bot modes
-- more obstacles, track themes, and track-specific mechanics
-- proper results screens, leaderboard flow, and replay tools
-
-### Full-Game Direction
-
-The most natural full version would be a short-session arcade game with many tracks, medals, ghosts, and replayability from improving lines and times. Bot races could stay as an extra mode, but the strongest long-term identity is probably fast single-player time-trial racing.
-
-## Exercise 6: Critique Of The Demo
-
-What works well:
-
-- The game has a clear objective and a clear success state.
-- The marble is fun to control when the track flow is good.
-- Boost pads, ghosts, and racing feedback make the project feel like a game rather than only a physics test.
-- Bullet handles rigid-body collisions and general motion well enough for the core idea.
-
-What still needs work:
-
-- Finish detection and off-track detection have needed repeated tuning and are still the most fragile part of the project.
-- The start sequence has also needed balancing because physics contact at the top of the track can create inconsistent openings.
-- Bot behavior is serviceable but still not polished enough to feel like a finished racing opponent system.
-- Visual polish has improved, but the obstacle and track presentation still need more consistency.
-
-Bullet-specific limitations:
-
-- Rolling sphere contact on sloped surfaces can be noisy, especially near edges and at the start line.
-- It is not ideal for “gamey” race rules out of the box, so extra logic is needed for track-relative finish checks, off-track rules, and boost-pad detection.
-- Pure physically correct behavior is not always the most fun behavior in a racing game.
-
-## Exercise 7: Should The Physics Be Changed For Fun?
-
-Yes. A more fun final game should not use raw physics without adjustment.
-
-The project already shows why:
-
-- The finish line needs game-friendly detection rather than strict geometric purity.
-- The start needs launch assistance to feel exciting.
-- Braking feels better when tuned as an arcade slowdown rather than a realistic hard drag.
-- Boost pads need immediate and readable response.
-- Off-track detection must be forgiving enough to avoid punishing minor physics jitter.
-
-So for a final game, I would keep Bullet as the physical base but continue to shape the experience with arcade-friendly rules layered on top. That means preserving believable motion while intentionally bending the system toward responsiveness, clarity, and fairness.
-
-## Code Sources / References
-
-This project is built from Panda3D, Bullet, course material, and the existing project codebase in this repository. The main implementation approach follows the Panda3D + Bullet sample style rather than external non-course game code.
+<object data="./Development_of_a_marble_racing_simulator.pdf" type="application/pdf" width="100%" height="700">
+  <p>PDF preview not available in this Markdown renderer. Open the report directly:
+  <a href="./Development_of_a_marble_racing_simulator.pdf">Development_of_a_marble_racing_simulator.pdf</a></p>
+</object>
